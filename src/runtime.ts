@@ -10,6 +10,7 @@ import type {
   CreateConversationEngineOptions,
   ConversationState,
   DecisionTrace,
+  FlowCallStatus,
   FlowVersion,
   OutboundMessage,
   ProcessTurnResult,
@@ -1009,18 +1010,19 @@ class Runtime {
       this.restoreFlowCallParentState(context.state, beforeScopedVariables, beforeVariableHistory, parentFrame);
       return { status: "failed", error: childContext.error };
     }
+    const childStatus = this.flowCallStatus(childContext.state.status);
     const output = this.flowCallOutputPatches(context, childFlow, operation.outputMapping ?? {}, afterScopedVariables, operation.operationId);
     const sharingResult = this.restoreFlowCallVariables(context.state, beforeScopedVariables, afterScopedVariables, sharing);
     context.state.variableHistory = beforeVariableHistory;
     this.restoreFlowCallFrame(context.state, parentFrame);
     if (output.error) return { status: "failed", error: output.error };
     context.state.status = "active";
-    context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: "completed" }));
-    const result = { status: "completed", outcome: "completed" };
+    context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: childStatus }));
+    const result = { status: childStatus, outcome: childStatus };
     const branch = this.matchResultBranch(operation.onResult ?? [], result);
     return {
       status: "completed",
-      outcome: "completed",
+      outcome: childStatus,
       branch,
       patches: output.patches,
       fragments: [{
@@ -1028,6 +1030,7 @@ class Runtime {
         data: {
           operationId: operation.operationId,
           flowVersionId: childFlow.flowVersionId,
+          status: childStatus,
           sharedVariables: sharingResult.sharedVariables,
           isolatedVariables: sharingResult.isolatedVariables,
           outputVariables: output.outputVariables,
@@ -1080,6 +1083,13 @@ class Runtime {
         continuation: clone(continuation),
       },
     };
+  }
+
+  private flowCallStatus(status: ConversationState["status"]): FlowCallStatus {
+    if (status === "completed" || status === "cancelled" || status === "failed" || status === "handoff") {
+      return status;
+    }
+    throw new Error(`Flow call finished with non-terminal status ${status}.`);
   }
 
   private activeFlowCallFrame(state: InternalState) {
@@ -1229,6 +1239,7 @@ class Runtime {
       context.state.currentStepId = String(context.state.pendingInput?.stepId ?? frame.currentStepId);
       return this.commit(context);
     }
+    const childStatus = this.flowCallStatus(context.state.status);
 
     this.restoreFlowCallParentState(context.state, metadata.parentScopedVariables, metadata.parentVariableHistory, metadata.parentFrame);
     context.state.executionStack = context.state.executionStack.slice(0, -1);
@@ -1244,11 +1255,11 @@ class Runtime {
     const sharing = this.flowCallSharingPolicy(operation);
     const sharingResult = this.restoreFlowCallVariables(context.state, metadata.parentScopedVariables, childScopedVariables, sharing);
     context.state.variableHistory = metadata.parentVariableHistory;
-    context.events.push(this.event(context, "flow_call_completed", { flowVersionId: frame.flowVersionId, operationId: operation.operationId, status: "completed" }));
-    const result = { status: "completed", outcome: "completed" };
+    context.events.push(this.event(context, "flow_call_completed", { flowVersionId: frame.flowVersionId, operationId: operation.operationId, status: childStatus }));
+    const result = { status: childStatus, outcome: childStatus };
     const flowCallResult: StepRunResult = {
       status: "completed",
-      outcome: "completed",
+      outcome: childStatus,
       branch: this.matchResultBranch(operation.onResult ?? [], result),
       patches: mappedOutput.patches,
       fragments: [{
@@ -1256,6 +1267,7 @@ class Runtime {
         data: {
           operationId: operation.operationId,
           flowVersionId: frame.flowVersionId,
+          status: childStatus,
           sharedVariables: sharingResult.sharedVariables,
           isolatedVariables: sharingResult.isolatedVariables,
           outputVariables: mappedOutput.outputVariables,
