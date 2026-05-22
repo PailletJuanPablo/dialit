@@ -118,6 +118,10 @@ Add tests for:
 - input validation retry.
 - condition routing.
 - action success and failure routing.
+- onEnter and onExit operations.
+- operation-result branch chaining.
+- append-only event and trace persistence.
+- explicit errors for missing step handlers, operation handlers, action handlers, responses, actions, variables, flow versions, and invalid targets.
 
 Run: `npm test`
 
@@ -182,6 +186,10 @@ Add tests for:
 - semantic billing classification.
 - generated responses.
 - handoff ending in handoff status.
+- custom step registration.
+- async commit semantics proving state is not reduced until async work resolves.
+- LLM contract failures for undeclared outcomes, undeclared variables, missing semantic resolver, and missing response generator.
+- routing purity validation that rejects conditional expressions outside `ConditionStep`.
 
 Run: `npm test`
 
@@ -225,6 +233,19 @@ git commit -m "feat: add advanced v0.1 flow capabilities"
 - Modify only if verification exposes a concrete defect.
 
 - [ ] **Step 1: Run full verification**
+
+Before running commands, inspect the scenario tests against the design and confirm they cover:
+
+- no silent fallbacks.
+- model validation errors.
+- response references.
+- onEnter and onExit operations.
+- operation branch chaining.
+- async commit semantics.
+- append-only persistence.
+- custom step and custom operation extension points.
+- scoped variable sharing and isolation.
+- trace assertions for variables, operations, actions, conditions, flow calls, LLM usage, messages, and handoff.
 
 Run:
 
