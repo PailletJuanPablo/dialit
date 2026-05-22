@@ -74,6 +74,23 @@ type StepRunResult = {
   error?: RuntimeError;
 };
 
+type OperationContinuation = {
+  phase: "on_enter" | "branch" | "on_exit" | "operation_result_branch";
+  operations: StepOperation[];
+  nextOperationIndex: number;
+  aggregateTarget?: StepTarget;
+  branchTarget?: StepTarget;
+  pendingTarget?: StepTarget;
+  parentOutcome?: string;
+  hadBranch?: boolean;
+  parentOperation?: Record<string, unknown>;
+  parentOperationOutcome?: string;
+  parentOperationTarget?: StepTarget;
+  parentContinuation?: OperationContinuation;
+};
+
+type OperationContinuationBase = Omit<OperationContinuation, "operations" | "nextOperationIndex" | "aggregateTarget">;
+
 const builtInStepTypes = new Set(["message", "menu", "input", "attachment", "condition", "end", "custom"]);
 const builtInOperationTypes = new Set([
   "send_message",
@@ -310,7 +327,10 @@ class Runtime {
     context.state.currentStepId = step.stepId;
     context.state.lastUserInput = request.input;
     const result = await this.handleStepInput(context, step, request.input);
-    if (result.error) return this.failWithError(context, result.error);
+    if (result.error) {
+      if (activeFlowCallFrame) return this.finishFlowCallInputTurn(context, activeFlowCallFrame, result.error);
+      return this.failWithError(context, result.error);
+    }
     await this.applyStepResult(context, step, result);
     await this.runAutomaticSteps(context);
     if (activeFlowCallFrame) return this.finishFlowCallInputTurn(context, activeFlowCallFrame);
@@ -362,9 +382,14 @@ class Runtime {
     context.events.push(this.event(context, "step_entered", { stepId: step.stepId, stepType }));
     context.fragments.push({ source: `step:${stepType}`, data: { stepId: step.stepId, phase: "enter" } });
 
-    const onEnter = await this.executeOperations(context, step, (step as any).onEnter ?? []);
+    const onEnter = await this.executeOperations(context, step, (step as any).onEnter ?? [], { phase: "on_enter" });
     if (onEnter.error || onEnter.target || onEnter.status === "waiting_input") return onEnter;
 
+    return this.enterStepBody(context, step);
+  }
+
+  private enterStepBody(context: TurnContext, step: StepDefinition): Promise<StepRunResult> | StepRunResult {
+    const stepType = (step as any).type as string;
     if (stepType === "message") return this.enterMessageStep(context, step);
     if (stepType === "menu") return this.enterMenuStep(context, step);
     if (stepType === "input") return this.enterInputStep(context, step);
@@ -387,10 +412,7 @@ class Runtime {
     this.collect(context, result);
     if (context.error) return;
     if (result.status === "waiting_input") {
-      const pendingStepId = String(result.waitState?.stepId ?? step.stepId);
-      context.state.status = "waiting_input";
-      context.state.pendingInput = { stepId: pendingStepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
-      context.state.currentStepId = pendingStepId;
+      this.markWaitingInput(context, step, result);
       return;
     }
 
@@ -398,17 +420,36 @@ class Runtime {
     let branch = result.branch;
     if (!branch && result.outcome) branch = this.resolveRoute(step, result.outcome);
     if (branch) {
-      const branchResult = await this.executeBranch(context, step, branch);
+      const branchResult = await this.executeBranch(context, step, branch, {
+        phase: "branch",
+        branchTarget: branch.target,
+        pendingTarget: target,
+        parentOutcome: result.outcome,
+        hadBranch: true,
+      });
       if (branchResult.error) {
         this.attachRuntimeError(context, branchResult.error);
+        return;
+      }
+      if (branchResult.status === "waiting_input") {
+        this.markWaitingInput(context, step, branchResult);
         return;
       }
       target = branchResult.target ?? target;
     }
 
-    const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? []);
+    const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? [], {
+      phase: "on_exit",
+      pendingTarget: target,
+      parentOutcome: result.outcome,
+      hadBranch: Boolean(branch),
+    });
     if (exitResult.error) {
       this.attachRuntimeError(context, exitResult.error);
+      return;
+    }
+    if (exitResult.status === "waiting_input") {
+      this.markWaitingInput(context, step, exitResult);
       return;
     }
     target = exitResult.target ?? target;
@@ -419,6 +460,13 @@ class Runtime {
 
     this.applyTarget(context, target);
     context.events.push(this.event(context, "step_completed", { stepId: step.stepId, outcome: result.outcome }));
+  }
+
+  private markWaitingInput(context: TurnContext, step: StepDefinition, result: StepRunResult): void {
+    const pendingStepId = String(result.waitState?.stepId ?? step.stepId);
+    context.state.status = "waiting_input";
+    context.state.pendingInput = { stepId: pendingStepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
+    context.state.currentStepId = pendingStepId;
   }
 
   private enterMessageStep(context: TurnContext, step: StepDefinition): StepRunResult | Promise<StepRunResult> {
@@ -752,39 +800,78 @@ class Runtime {
     return { valid: false, error: this.runtimeError("VALIDATOR_NOT_REGISTERED", `Validator ${validator.type} is not registered.`, false) };
   }
 
-  private async executeBranch(context: TurnContext, step: StepDefinition, branch: StepBranch): Promise<StepRunResult> {
-    const operationResult = await this.executeOperations(context, step, (branch as any).operations ?? []);
-    if (operationResult.error) return operationResult;
+  private async executeBranch(context: TurnContext, step: StepDefinition, branch: StepBranch, continuation?: OperationContinuationBase): Promise<StepRunResult> {
+    const operationResult = await this.executeOperations(context, step, (branch as any).operations ?? [], continuation ?? {
+      phase: "branch",
+      branchTarget: branch.target,
+      hadBranch: true,
+    });
+    if (operationResult.error || operationResult.status === "waiting_input") return operationResult;
     return { status: "completed", target: operationResult.target ?? branch.target, messages: operationResult.messages, events: operationResult.events, patches: operationResult.patches, fragments: operationResult.fragments };
   }
 
-  private async executeOperations(context: TurnContext, step: StepDefinition, operations: StepOperation[]): Promise<StepRunResult> {
-    const aggregate: StepRunResult = { status: "completed", messages: [], events: [], patches: [], fragments: [] };
-    for (const operation of operations as any[]) {
+  private async executeOperations(
+    context: TurnContext,
+    step: StepDefinition,
+    operations: StepOperation[],
+    continuation?: OperationContinuationBase,
+    startIndex = 0,
+    initialTarget?: StepTarget,
+  ): Promise<StepRunResult> {
+    const aggregate: StepRunResult = { status: "completed", target: initialTarget, messages: [], events: [], patches: [], fragments: [] };
+    for (let index = startIndex; index < (operations as any[]).length; index++) {
+      const operation = (operations as any[])[index];
       if (!builtInOperationTypes.has(operation.type)) {
         return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operation.type} is not registered.`, false) };
       }
       context.events.push(this.event(context, "operation_started", { operationType: operation.type, operationId: operation.operationId }));
-      const result = await this.executeOperation(context, step, operation);
-      this.collect(context, result);
-      if (result.status === "waiting_input") return result;
-      if (result.error) {
-        context.events.push(this.event(context, "operation_failed", { operationType: operation.type, operationId: operation.operationId, code: result.error.code }));
-        return result;
-      }
-      if (result.branch) {
-        const branchResult = await this.executeBranch(context, step, result.branch);
-        this.collect(context, branchResult);
-        if (branchResult.error) return branchResult;
-        if (branchResult.target) aggregate.target = branchResult.target;
-      }
-      context.events.push(this.event(context, "operation_completed", { operationType: operation.type, operationId: operation.operationId, outcome: result.outcome }));
-      if (result.target) aggregate.target = result.target;
+      const operationContinuation = continuation ? {
+        ...continuation,
+        operations: clone(operations),
+        nextOperationIndex: index + 1,
+        aggregateTarget: aggregate.target,
+      } : undefined;
+      const result = await this.executeOperation(context, step, operation, operationContinuation);
+      const terminal = await this.consumeOperationResult(context, step, operation, result, aggregate, operationContinuation);
+      if (terminal) return terminal;
     }
     return aggregate;
   }
 
-  private async executeOperation(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
+  private async consumeOperationResult(
+    context: TurnContext,
+    step: StepDefinition,
+    operation: any,
+    result: StepRunResult,
+    aggregate: StepRunResult,
+    continuation?: OperationContinuation,
+  ): Promise<StepRunResult | undefined> {
+    this.collect(context, result);
+    if (result.status === "waiting_input") return result;
+    if (result.error) {
+      context.events.push(this.event(context, "operation_failed", { operationType: operation.type, operationId: operation.operationId, code: result.error.code }));
+      return result;
+    }
+    if (result.branch) {
+      const branchResult = await this.executeBranch(context, step, result.branch, continuation ? {
+        phase: "operation_result_branch",
+        branchTarget: result.branch.target,
+        parentOperation: clone(operation),
+        parentOperationOutcome: result.outcome,
+        parentOperationTarget: result.target,
+        parentContinuation: clone(continuation),
+      } : undefined);
+      this.collect(context, branchResult);
+      if (branchResult.status === "waiting_input") return branchResult;
+      if (branchResult.error) return branchResult;
+      if (branchResult.target) aggregate.target = branchResult.target;
+    }
+    context.events.push(this.event(context, "operation_completed", { operationType: operation.type, operationId: operation.operationId, outcome: result.outcome }));
+    if (result.target) aggregate.target = result.target;
+    return undefined;
+  }
+
+  private async executeOperation(context: TurnContext, step: StepDefinition, operation: any, continuation?: OperationContinuation): Promise<StepRunResult> {
     if (operation.type === "send_message") {
       const rendered = await this.renderOne(context, step, operation.message);
       return { status: "completed", messages: rendered.messages, events: rendered.events, fragments: [{ source: "operation:send_message", data: { operationId: operation.operationId } }, ...rendered.fragments] };
@@ -811,7 +898,7 @@ class Runtime {
       return { status: "completed", patches: [{ type: "invalidate", variableId: operation.variableId, source: "operation", metadata: { operationId: operation.operationId, invalidated: true }, scope: operation.scope } as any] };
     }
     if (operation.type === "run_action") return this.executeAction(context, step, operation);
-    if (operation.type === "call_flow") return this.executeFlowCall(context, step, operation);
+    if (operation.type === "call_flow") return this.executeFlowCall(context, step, operation, continuation);
     if (operation.type === "handoff") return this.executeHandoff(context, step, operation);
     if (operation.type === "custom") return this.executeCustomOperation(context, step, operation);
     if (operation.type === "emit_event") {
@@ -885,7 +972,7 @@ class Runtime {
     };
   }
 
-  private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
+  private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any, continuation?: OperationContinuation): Promise<StepRunResult> {
     const childFlow = await this.getFlowVersion(operation.flowVersionId);
     if (!childFlow) return { status: "failed", error: this.runtimeError("FLOW_VERSION_NOT_FOUND", `Flow version ${operation.flowVersionId} was not found.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
@@ -907,7 +994,7 @@ class Runtime {
     if (String(childContext.state.status) === "waiting_input") {
       const childCurrentStepId = childContext.state.currentStepId;
       const childPendingInput = clone(childContext.state.pendingInput ?? { stepId: childCurrentStepId });
-      const frame = this.createFlowCallFrame(childFlow, step, operation, parentFrame, beforeScopedVariables, beforeVariableHistory, afterScopedVariables, afterVariableHistory);
+      const frame = this.createFlowCallFrame(childFlow, step, operation, parentFrame, beforeScopedVariables, beforeVariableHistory, afterScopedVariables, afterVariableHistory, continuation);
       frame.currentStepId = childCurrentStepId;
       this.restoreFlowCallParentState(context.state, beforeScopedVariables, beforeVariableHistory, parentFrame);
       context.state.executionStack = [...context.state.executionStack, frame];
@@ -972,6 +1059,7 @@ class Runtime {
     parentVariableHistory: InternalState["variableHistory"],
     childScopedVariables: InternalState["scopedVariables"],
     childVariableHistory: InternalState["variableHistory"],
+    continuation?: OperationContinuation,
   ) {
     return {
       frameId: this.newId("newExecutionFrameId", "frame"),
@@ -989,6 +1077,7 @@ class Runtime {
         parentVariableHistory: clone(parentVariableHistory),
         childScopedVariables: clone(childScopedVariables),
         childVariableHistory: clone(childVariableHistory),
+        continuation: clone(continuation),
       },
     };
   }
@@ -1115,13 +1204,19 @@ class Runtime {
     return { patches, outputVariables: outputVariables.sort() };
   }
 
-  private async finishFlowCallInputTurn(context: TurnContext, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>): Promise<ProcessTurnResult> {
+  private async finishFlowCallInputTurn(context: TurnContext, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>, childError?: RuntimeError): Promise<ProcessTurnResult> {
     const metadata = frame.metadata as any;
     const parentFlow = await this.getFlowVersion(context.state.flowVersionId);
     if (!parentFlow) return this.fail(context, "FLOW_VERSION_NOT_FOUND", `Flow version ${context.state.flowVersionId} was not found.`, false);
 
     const childScopedVariables = clone(context.state.scopedVariables);
     const childVariableHistory = clone(context.state.variableHistory);
+    const error = childError ?? context.error;
+    if (error) {
+      this.restoreFlowCallParentState(context.state, metadata.parentScopedVariables, metadata.parentVariableHistory, metadata.parentFrame);
+      context.state.executionStack = context.state.executionStack.slice(0, -1);
+      return this.failWithError(context, error);
+    }
     if (context.state.status === "waiting_input") {
       const childPendingInput = clone(context.state.pendingInput);
       metadata.childScopedVariables = childScopedVariables;
@@ -1138,8 +1233,6 @@ class Runtime {
     this.restoreFlowCallParentState(context.state, metadata.parentScopedVariables, metadata.parentVariableHistory, metadata.parentFrame);
     context.state.executionStack = context.state.executionStack.slice(0, -1);
 
-    if (context.error) return this.failWithError(context, context.error);
-
     context.flow = parentFlow;
     const parentStep = this.getStep(parentFlow, frame.calledFromStepId ?? context.state.currentStepId);
     if (!parentStep) return this.fail(context, "STEP_NOT_FOUND", "Flow call parent step was not found.", false);
@@ -1152,9 +1245,8 @@ class Runtime {
     const sharingResult = this.restoreFlowCallVariables(context.state, metadata.parentScopedVariables, childScopedVariables, sharing);
     context.state.variableHistory = metadata.parentVariableHistory;
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: frame.flowVersionId, operationId: operation.operationId, status: "completed" }));
-    context.events.push(this.event(context, "operation_completed", { operationType: "call_flow", operationId: operation.operationId, outcome: "completed" }));
     const result = { status: "completed", outcome: "completed" };
-    await this.applyStepResult(context, parentStep, {
+    const flowCallResult: StepRunResult = {
       status: "completed",
       outcome: "completed",
       branch: this.matchResultBranch(operation.onResult ?? [], result),
@@ -1169,9 +1261,190 @@ class Runtime {
           outputVariables: mappedOutput.outputVariables,
         },
       }],
-    });
+    };
+    const continuation = metadata.continuation as OperationContinuation | undefined;
+    if (continuation) {
+      const operationResult = await this.resumeOperationListAfterFlowCall(context, parentStep, operation, flowCallResult, continuation);
+      if (operationResult.error) return this.failWithError(context, operationResult.error);
+      if (operationResult.status === "waiting_input") {
+        this.markWaitingInput(context, parentStep, operationResult);
+        return this.commit(context);
+      }
+      await this.completeResumedOperationContinuation(context, parentStep, continuation, operationResult);
+    } else {
+      context.events.push(this.event(context, "operation_completed", { operationType: "call_flow", operationId: operation.operationId, outcome: "completed" }));
+      await this.applyStepResult(context, parentStep, flowCallResult);
+    }
+    if (context.error) return this.failWithError(context, context.error);
     await this.runAutomaticSteps(context);
     return this.commit(context);
+  }
+
+  private async resumeOperationListAfterFlowCall(
+    context: TurnContext,
+    step: StepDefinition,
+    operation: any,
+    result: StepRunResult,
+    continuation: OperationContinuation,
+  ): Promise<StepRunResult> {
+    const aggregate: StepRunResult = {
+      status: "completed",
+      target: continuation.aggregateTarget,
+      messages: [],
+      events: [],
+      patches: [],
+      fragments: [],
+    };
+    const terminal = await this.consumeOperationResult(context, step, operation, result, aggregate, continuation);
+    if (terminal) return terminal;
+    return this.executeOperations(
+      context,
+      step,
+      continuation.operations,
+      this.operationContinuationBase(continuation),
+      continuation.nextOperationIndex,
+      aggregate.target,
+    );
+  }
+
+  private async completeResumedOperationContinuation(
+    context: TurnContext,
+    step: StepDefinition,
+    continuation: OperationContinuation,
+    result: StepRunResult,
+  ): Promise<void> {
+    if (continuation.phase === "on_enter") {
+      if (result.target) {
+        await this.applyStepResult(context, step, { status: "completed", target: result.target });
+        return;
+      }
+      const stepResult = await this.enterStepBody(context, step);
+      if (stepResult.error) {
+        this.attachRuntimeError(context, stepResult.error);
+        return;
+      }
+      await this.applyStepResult(context, step, stepResult);
+      return;
+    }
+
+    if (continuation.phase === "branch") {
+      const target = result.target ?? continuation.branchTarget ?? continuation.pendingTarget;
+      await this.completeAfterBranchOperations(context, step, target, continuation.parentOutcome);
+      return;
+    }
+
+    if (continuation.phase === "operation_result_branch") {
+      await this.completeAfterOperationResultBranch(context, step, continuation, result);
+      return;
+    }
+
+    this.completeStepWithTarget(
+      context,
+      step,
+      result.target ?? continuation.pendingTarget,
+      continuation.parentOutcome,
+      Boolean(continuation.hadBranch),
+    );
+  }
+
+  private async completeAfterOperationResultBranch(
+    context: TurnContext,
+    step: StepDefinition,
+    continuation: OperationContinuation,
+    result: StepRunResult,
+  ): Promise<void> {
+    if (!continuation.parentContinuation || !continuation.parentOperation) {
+      this.attachError(context, "FLOW_CALL_CONTINUATION_INVALID", "Flow call continuation is incomplete.", false);
+      return;
+    }
+
+    const parentContinuation = continuation.parentContinuation;
+    const aggregate: StepRunResult = {
+      status: "completed",
+      target: parentContinuation.aggregateTarget,
+      messages: [],
+      events: [],
+      patches: [],
+      fragments: [],
+    };
+    const branchTarget = result.target ?? continuation.branchTarget;
+    if (branchTarget) aggregate.target = branchTarget;
+    context.events.push(this.event(context, "operation_completed", {
+      operationType: continuation.parentOperation.type,
+      operationId: continuation.parentOperation.operationId,
+      outcome: continuation.parentOperationOutcome,
+    }));
+    if (continuation.parentOperationTarget) aggregate.target = continuation.parentOperationTarget;
+
+    const parentResult = await this.executeOperations(
+      context,
+      step,
+      parentContinuation.operations,
+      this.operationContinuationBase(parentContinuation),
+      parentContinuation.nextOperationIndex,
+      aggregate.target,
+    );
+    if (parentResult.error) {
+      this.attachRuntimeError(context, parentResult.error);
+      return;
+    }
+    if (parentResult.status === "waiting_input") {
+      this.markWaitingInput(context, step, parentResult);
+      return;
+    }
+    await this.completeResumedOperationContinuation(context, step, parentContinuation, parentResult);
+  }
+
+  private async completeAfterBranchOperations(
+    context: TurnContext,
+    step: StepDefinition,
+    target: StepTarget | undefined,
+    outcome: string | undefined,
+  ): Promise<void> {
+    const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? [], {
+      phase: "on_exit",
+      pendingTarget: target,
+      parentOutcome: outcome,
+      hadBranch: true,
+    });
+    if (exitResult.error) {
+      this.attachRuntimeError(context, exitResult.error);
+      return;
+    }
+    if (exitResult.status === "waiting_input") {
+      this.markWaitingInput(context, step, exitResult);
+      return;
+    }
+    this.completeStepWithTarget(context, step, exitResult.target ?? target, outcome, true);
+  }
+
+  private completeStepWithTarget(
+    context: TurnContext,
+    step: StepDefinition,
+    target: StepTarget | undefined,
+    outcome: string | undefined,
+    hadBranch: boolean,
+  ): void {
+    let resolvedTarget = target;
+    if (!resolvedTarget && !hadBranch && step.type === "message") {
+      resolvedTarget = { type: "end", status: "completed" };
+    }
+    this.applyTarget(context, resolvedTarget);
+    context.events.push(this.event(context, "step_completed", { stepId: step.stepId, outcome }));
+  }
+
+  private operationContinuationBase(continuation: OperationContinuation): OperationContinuationBase {
+    return {
+      phase: continuation.phase,
+      branchTarget: continuation.branchTarget,
+      pendingTarget: continuation.pendingTarget,
+      parentOutcome: continuation.parentOutcome,
+      hadBranch: continuation.hadBranch,
+      parentOperation: continuation.parentOperation,
+      parentOperationOutcome: continuation.parentOperationOutcome,
+      parentOperationTarget: continuation.parentOperationTarget,
+      parentContinuation: continuation.parentContinuation,
+    };
   }
 
   private async executeHandoff(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {

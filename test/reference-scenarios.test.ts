@@ -972,6 +972,119 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     ]);
   });
 
+  it("keeps a parent branch waiting while a called flow waits for input", async () => {
+    const runtime = engineWith(waitingBranchFlowParent(), {
+      flowVersions: [waitingFlowChild()],
+    });
+
+    await runtime.startConversation({
+      conversationId: "conversation-branch-flow-call",
+      flowVersionId: "waiting-branch-parent-v1",
+    });
+
+    const waiting = await runtime.processUserInput({
+      conversationId: "conversation-branch-flow-call",
+      input: textInput("conversation-branch-flow-call", "child"),
+    });
+
+    expect(waiting.error).toBeUndefined();
+    expect(waiting.state.status).toBe("waiting_input");
+    expect(waiting.state.currentStepId).toBe("child_question");
+    expect(waiting.state.executionStack).toHaveLength(1);
+    expect(texts(waiting)).toContain("Child question?");
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-branch-flow-call",
+      input: textInput("conversation-branch-flow-call", "branch child"),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "parentAnswer")).toBe("branch child");
+    expect(result.state.executionStack).toEqual([]);
+    expect(result.state.status).toBe("completed");
+    expect(result.state.currentStepId).toBe("branch_done");
+    expect(texts(result)).toContain("Branch received branch child.");
+  });
+
+  it("continues parent operations after a waiting flow call completes", async () => {
+    const runtime = engineWith(waitingContinuationFlowParent(), {
+      flowVersions: [waitingFlowChild()],
+    });
+
+    const start = await runtime.startConversation({
+      conversationId: "conversation-flow-call-continuation",
+      flowVersionId: "waiting-continuation-parent-v1",
+    });
+
+    expect(start.error).toBeUndefined();
+    expect(start.state.status).toBe("waiting_input");
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-flow-call-continuation",
+      input: textInput("conversation-flow-call-continuation", "continued child"),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "parentAnswer")).toBe("continued child");
+    expect(variableValue(result, "afterCall")).toBe("continued");
+    expect(result.state.executionStack).toEqual([]);
+    expect(texts(result)).toContain("After continued child: continued.");
+  });
+
+  it("keeps parent onExit processing waiting while a called flow waits for input", async () => {
+    const runtime = engineWith(waitingOnExitFlowParent(), {
+      flowVersions: [waitingFlowChild()],
+    });
+
+    const start = await runtime.startConversation({
+      conversationId: "conversation-on-exit-flow-call",
+      flowVersionId: "waiting-on-exit-parent-v1",
+    });
+
+    expect(start.error).toBeUndefined();
+    expect(start.state.status).toBe("waiting_input");
+    expect(start.state.currentStepId).toBe("child_question");
+    expect(start.state.executionStack).toHaveLength(1);
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-on-exit-flow-call",
+      input: textInput("conversation-on-exit-flow-call", "exit child"),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "parentAnswer")).toBe("exit child");
+    expect(result.state.executionStack).toEqual([]);
+    expect(result.state.status).toBe("completed");
+    expect(result.state.currentStepId).toBe("exit_done");
+    expect(texts(result)).toContain("Exit received exit child.");
+  });
+
+  it("restores parent state when resumed child input fails", async () => {
+    const runtime = engineWith(waitingErrorFlowParent(), {
+      flowVersions: [waitingErrorFlowChild()],
+      semanticInputResolver: async () => ({
+        outcome: "outside_contract",
+        variables: {},
+      }),
+    });
+
+    await runtime.startConversation({
+      conversationId: "conversation-child-error",
+      flowVersionId: "waiting-error-parent-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-child-error",
+      input: textInput("conversation-child-error", "bad child"),
+    });
+
+    expectStructuredFailure(result, "SEMANTIC_RESULT_OUT_OF_CONTRACT");
+    expect(result.state.status).toBe("failed");
+    expect(result.state.executionStack).toEqual([]);
+    expect(variableValue(result, "childSecret")).toBeUndefined();
+    expect(variableHistory(result, "childSecret")).toEqual([]);
+  });
+
   it("honors injected repositories, config, runtime, and exposes services in custom contexts", async () => {
     const savedConversations: unknown[] = [];
     const appendedEvents: unknown[] = [];
@@ -2104,6 +2217,124 @@ function waitingFlowChild(): FlowVersion {
       }),
     ],
   });
+}
+
+function waitingBranchFlowParent(): FlowVersion {
+  return flowVersion("waiting-branch-parent-v1", {
+    flowId: "waiting-branch-parent",
+    startStepId: "choose_child",
+    variables: [variable("parentAnswer", "string", "conversation")],
+    steps: [
+      menuStep("choose_child", "Choose a branch.", [
+        option("child", "Child", ["child"], branch({
+          operations: [{ ...callWaitingChild(), onResult: [] }],
+          target: stepTarget("branch_done"),
+        })),
+      ]),
+      messageStep("branch_done", [{ mode: "template", template: "Branch received {{parentAnswer}}.", variableIds: ["parentAnswer"] }]),
+    ],
+  });
+}
+
+function waitingContinuationFlowParent(): FlowVersion {
+  return flowVersion("waiting-continuation-parent-v1", {
+    flowId: "waiting-continuation-parent",
+    startStepId: "call_child",
+    variables: [
+      variable("parentAnswer", "string", "conversation"),
+      variable("afterCall", "string", "conversation"),
+    ],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [
+          callWaitingChild(),
+          setVariable("afterCall", "continued", "operation"),
+        ],
+        routes: [route("next", branch({ target: stepTarget("parent_done") }))],
+      }),
+      messageStep("parent_done", [{ mode: "template", template: "After {{parentAnswer}}: {{afterCall}}.", variableIds: ["parentAnswer", "afterCall"] }]),
+    ],
+  });
+}
+
+function waitingOnExitFlowParent(): FlowVersion {
+  return flowVersion("waiting-on-exit-parent-v1", {
+    flowId: "waiting-on-exit-parent",
+    startStepId: "leave_step",
+    variables: [variable("parentAnswer", "string", "conversation")],
+    steps: [
+      messageStep("leave_step", [], {
+        autoAdvance: true,
+        onExit: [{ ...callWaitingChild(), onResult: [] }],
+        routes: [route("next", branch({ target: stepTarget("exit_done") }))],
+      }),
+      messageStep("exit_done", [{ mode: "template", template: "Exit received {{parentAnswer}}.", variableIds: ["parentAnswer"] }]),
+    ],
+  });
+}
+
+function waitingErrorFlowParent(): FlowVersion {
+  return flowVersion("waiting-error-parent-v1", {
+    flowId: "waiting-error-parent",
+    startStepId: "call_child",
+    variables: [variable("parentAnswer", "string", "conversation")],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [callWaitingChild("waiting-error-child-v1")],
+      }),
+    ],
+  });
+}
+
+function waitingErrorFlowChild(): FlowVersion {
+  return flowVersion("waiting-error-child-v1", {
+    flowId: "waiting-error-child",
+    startStepId: "prepare_child",
+    variables: [
+      variable("childAnswer", "string", "conversation"),
+      variable("childSecret", "string", "conversation"),
+    ],
+    steps: [
+      messageStep("prepare_child", [], {
+        autoAdvance: true,
+        onEnter: [setVariable("childSecret", "child-only", "operation")],
+        routes: [route("next", branch({ target: stepTarget("child_question") }))],
+      }),
+      inputStep("child_question", "Child question?", "childAnswer", {
+        semanticTasks: [
+          {
+            taskId: "child_error_contract",
+            mode: "after_valid_capture",
+            allowedOutcomes: ["inside_contract"],
+            allowedVariableIds: [],
+          },
+        ],
+        routes: [route("captured", branch({ target: endTarget("completed") }))],
+      }),
+    ],
+  });
+}
+
+function callWaitingChild(flowVersionId = "waiting-flow-child-v1") {
+  return {
+    type: "call_flow",
+    operationId: `call_${flowVersionId}`,
+    flowVersionId,
+    outputMapping: {
+      childAnswer: "parentAnswer",
+    },
+    variableSharing: {
+      scopes: [],
+    },
+    onResult: [
+      {
+        match: { type: "outcome", outcome: "completed" },
+        branch: branch({ target: stepTarget("parent_done") }),
+      },
+    ],
+  };
 }
 
 function compositionFlow(): FlowVersion {
