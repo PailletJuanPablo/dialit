@@ -4,13 +4,43 @@
   "description": "TypeScript conversational flow engine for versioned chatbot definitions.",
   "type": "module",
   "main": "./dist/index.js",
+  "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./runtime-support": {
+      "types": "./dist/runtime-support.d.ts",
+      "import": "./dist/runtime-support.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "chatbot",
+    "conversation",
+    "workflow",
+    "typescript",
+    "llm"
+  ],
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "docs/api-integration.md",
+    "docs/flow-authoring.md",
+    "docs/web-chatbot-demo.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:package": "node scripts/package-smoke-test.mjs",
+    "pack:dry-run": "npm pack --dry-run",
+    "prepack": "npm run build",
     "demo:web": "npm --prefix examples/web-chatbot run dev -- --port 5173",
     "demo:web:build": "npm --prefix examples/web-chatbot run build",
     "demo:web:test": "npm --prefix examples/web-chatbot test -- --run"
