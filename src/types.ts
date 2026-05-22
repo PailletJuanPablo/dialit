@@ -1415,9 +1415,14 @@ export type RuntimeError =
     | InvalidSemanticVariableRuntimeError
     | InvalidGeneratedResponseVariableRuntimeError
     | ModelValidationRuntimeError
+    | OperationalRuntimeError
     | UnhandledRuntimeError;
 
 export type RuntimeErrorCode =
+    | PublicRuntimeErrorCode
+    | OperationalRuntimeErrorCode;
+
+export type PublicRuntimeErrorCode =
     | "missing_step_handler"
     | "missing_operation_handler"
     | "missing_action_handler"
@@ -1435,6 +1440,30 @@ export type RuntimeErrorCode =
     | "invalid_generated_response_variable"
     | "model_validation_failed"
     | "unhandled_runtime_error";
+
+export type OperationalRuntimeErrorCode =
+    | "ACTION_HANDLER_NOT_REGISTERED"
+    | "ACTION_NOT_FOUND"
+    | "ACTION_RESULT_OUT_OF_CONTRACT"
+    | "CONVERSATION_NOT_FOUND"
+    | "CONVERSATION_NOT_WAITING_FOR_INPUT"
+    | "CUSTOM_OPERATION_CONTRACT_NOT_REGISTERED"
+    | "CUSTOM_OPERATION_RESULT_OUT_OF_CONTRACT"
+    | "FLOW_VERSION_NOT_FOUND"
+    | "INPUT_PROCESSING_CONTEXT_REQUIRED"
+    | "INVALID_TARGET"
+    | "LLM_RESPONSE_GENERATOR_NOT_REGISTERED"
+    | "MAX_STEP_EXECUTIONS_EXCEEDED"
+    | "OPERATION_EXECUTION_CONTEXT_REQUIRED"
+    | "OPERATION_HANDLER_NOT_REGISTERED"
+    | "RESPONSE_NOT_FOUND"
+    | "RESPONSE_RENDERING_CONTEXT_REQUIRED"
+    | "SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED"
+    | "SEMANTIC_RESULT_OUT_OF_CONTRACT"
+    | "STEP_DOES_NOT_ACCEPT_INPUT"
+    | "STEP_HANDLER_NOT_REGISTERED"
+    | "STEP_NOT_FOUND"
+    | "VALIDATOR_NOT_REGISTERED";
 
 export interface BaseRuntimeError<TCode extends RuntimeErrorCode> {
     code: TCode;
@@ -1509,6 +1538,10 @@ export interface InvalidGeneratedResponseVariableRuntimeError extends BaseRuntim
 
 export interface ModelValidationRuntimeError extends BaseRuntimeError<"model_validation_failed"> {
     issues: ValidationIssue[];
+}
+
+export interface OperationalRuntimeError extends BaseRuntimeError<OperationalRuntimeErrorCode> {
+    [key: string]: unknown;
 }
 
 export interface UnhandledRuntimeError extends BaseRuntimeError<"unhandled_runtime_error"> { }
