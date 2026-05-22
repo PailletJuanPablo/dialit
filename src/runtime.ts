@@ -1,9 +1,7 @@
 import type {
-  ActionDefinition,
   ActionExecutionContext,
   AttachmentInput,
   AttachmentStepDefinition,
-  CallFlowOperation,
   ConditionExpression,
   ConditionStepDefinition,
   Conversation,
@@ -13,29 +11,21 @@ import type {
   ConversationEvent,
   ConversationEventType,
   ConversationEngineConfig,
-  CreateConversationEngineOptions,
   ConversationState,
   CustomOperation,
-  CustomOperationResult,
   DecisionTrace,
   FlowCallStatus,
   FlowExecutionFrame,
   FlowVersion,
-  HandoffOperation,
   IdGenerator,
   InputProcessingContext,
   InputStepDefinition,
   InvalidInputBehavior,
-  LlmGeneratedResponse,
-  LlmUsageRecord,
   MenuOption,
   MenuStepDefinition,
   MessageStepDefinition,
-  Metadata,
   OperationExecutionContext,
-  OperationResult,
   OutboundMessage,
-  PendingInputState,
   ProcessTurnResult,
   ResponsePlan,
   ResponseRenderingContext,
@@ -48,153 +38,46 @@ import type {
   StepBranch,
   StepDefinition,
   StepExecutionContext,
-  StepHandler,
   StepOperation,
   StepOutcome,
   StepResult,
   StepTarget,
-  TraceBuildInput,
   TraceFragment,
   Turn,
   UserInput,
   ValidatorDefinition,
-  VariableHistoryEntry,
-  VariableId,
   VariablePatch,
   VariableScope,
-  VariableValue,
   VariableValueSource,
   ValueExpression,
 } from "./types.js";
-
-type EngineOptions = CreateConversationEngineOptions;
-
-type IdFactoryName = keyof IdGenerator;
-
-type RuntimeVariableValue = VariableValue & {
-  metadata?: Metadata;
-};
-
-type InternalState = Omit<ConversationState, "variables" | "variableHistory"> & {
-  variables: Record<VariableId, RuntimeVariableValue>;
-  scopedVariables: Record<string, RuntimeVariableValue>;
-  variableHistory: Record<VariableId, VariableHistoryEntry[]>;
-  __flowScopes?: Record<string, VariableScope>;
-};
-
-type FlowCallFrameMetadata = Metadata & {
-  kind: "flow_call";
-  operation: RuntimeCallFlowOperation;
-  parentFrame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">;
-  parentScopedVariables: InternalState["scopedVariables"];
-  parentVariableHistory: InternalState["variableHistory"];
-  childScopedVariables: InternalState["scopedVariables"];
-  childVariableHistory: InternalState["variableHistory"];
-  continuation?: OperationContinuation;
-};
-
-type FlowCallExecutionFrame = FlowExecutionFrame & {
-  metadata: FlowCallFrameMetadata;
-};
-
-type RuntimeHandoffOperation = HandoffOperation & {
-  queueId?: string;
-  saveHandoffIdToVariableId?: VariableId;
-};
-
-type RuntimeCallFlowOperation = CallFlowOperation & {
-  sharedVariableIds?: VariableId[];
-};
-
-type RuntimeCustomOperationResult = (CustomOperationResult | OperationResult) & {
-  variablePatches?: VariablePatch[];
-  trace?: TraceFragment;
-};
-
-type ResultBranch = {
-  match: {
-    type: "outcome" | "status" | "error_code";
-    outcome?: StepOutcome;
-    status?: string;
-    errorCode?: string;
-  };
-  branch: StepBranch;
-};
-
-type BranchMatchResult = {
-  outcome?: StepOutcome | string;
-  status?: string;
-  errorCode?: string;
-  handoffId?: string;
-};
-
-type RenderedOutput = {
-  messages: OutboundMessage[];
-  events: ConversationEvent[];
-  fragments: TraceFragment[];
-};
-
-type StepWaitState = Partial<PendingInputState> & {
-  stepId?: string;
-};
-
-type TurnContext = {
-  flow: FlowVersion;
-  conversation: Conversation;
-  state: InternalState;
-  turn: Turn;
-  messages: OutboundMessage[];
-  events: ConversationEvent[];
-  fragments: TraceFragment[];
-  patches: VariablePatch[];
-  llmUsage: LlmUsageRecord[];
-  initialStepId?: string;
-  error?: RuntimeError;
-  nested?: boolean;
-};
-
-type StepRunResult = {
-  status: "completed" | "waiting_input" | "failed";
-  outcome?: string;
-  branch?: StepBranch;
-  target?: StepTarget;
-  messages?: OutboundMessage[];
-  events?: ConversationEvent[];
-  patches?: VariablePatch[];
-  fragments?: TraceFragment[];
-  waitState?: StepWaitState;
-  error?: RuntimeError;
-};
-
-type OperationContinuation = {
-  phase: "on_enter" | "branch" | "on_exit" | "operation_result_branch";
-  operations: StepOperation[];
-  nextOperationIndex: number;
-  aggregateTarget?: StepTarget;
-  branchTarget?: StepTarget;
-  pendingTarget?: StepTarget;
-  parentOutcome?: string;
-  hadBranch?: boolean;
-  parentOperation?: StepOperation;
-  parentOperationOutcome?: string;
-  parentOperationTarget?: StepTarget;
-  parentContinuation?: OperationContinuation;
-};
-
-type OperationContinuationBase = Omit<OperationContinuation, "operations" | "nextOperationIndex" | "aggregateTarget">;
-
-const builtInStepTypes = new Set(["message", "menu", "input", "attachment", "condition", "end", "custom"]);
-const builtInOperationTypes = new Set([
-  "send_message",
-  "set_variable",
-  "unset_variable",
-  "invalidate_variable",
-  "run_action",
-  "call_flow",
-  "emit_event",
-  "handoff",
-  "custom",
-]);
+import { clone } from "./runtime-support.js";
+import { builtInOperationTypes } from "./runtime/constants.js";
+import {
+  emptyRendered,
+  isLlmGeneratedResponse,
+  isScopedInitialVariables,
+  isVariableScope,
+} from "./runtime/helpers.js";
+import { createInternalRepositories } from "./runtime/repositories.js";
+import { createRuntimeServices } from "./runtime/services.js";
+import type {
+  BranchMatchResult,
+  EngineOptions,
+  FlowCallExecutionFrame,
+  IdFactoryName,
+  InternalState,
+  OperationContinuation,
+  OperationContinuationBase,
+  RenderedOutput,
+  ResultBranch,
+  RuntimeCallFlowOperation,
+  RuntimeCustomOperationResult,
+  RuntimeHandoffOperation,
+  RuntimeVariableValue,
+  StepRunResult,
+  TurnContext,
+} from "./runtime/internal-types.js";
 
 export function createConversationEngine(options: EngineOptions = {}): ConversationEngine & ConversationEngineModule {
   const runtime = new Runtime(options);
@@ -238,7 +121,14 @@ class Runtime {
       ...(options.config ?? {}),
     };
     this.maxStepExecutionsPerTurn = config.maxStepExecutionsPerTurn ?? options.maxStepExecutionsPerTurn ?? 20;
-    this.internalRepositories = this.createInternalRepositories();
+    this.internalRepositories = createInternalRepositories({
+      flowVersions: this.flowVersions,
+      conversations: this.conversations,
+      states: this.states,
+      events: this.events,
+      traces: this.traces,
+      toInternalState: (state) => this.toInternalState(state),
+    });
     this.repositories = {
       flowVersions: options.repositories?.flowVersions ?? this.internalRepositories.flowVersions,
       conversations: options.repositories?.conversations ?? this.internalRepositories.conversations,
@@ -266,109 +156,16 @@ class Runtime {
     };
   }
 
-  private createInternalRepositories(): ConversationEngineRepositories {
-    return {
-      flowVersions: {
-        getById: async (flowVersionId) => clone(this.flowVersions.get(flowVersionId)),
-        save: async (flowVersion) => {
-          this.flowVersions.set(flowVersion.flowVersionId, clone(flowVersion));
-        },
-      },
-      conversations: {
-        getById: async (conversationId) => clone(this.conversations.get(conversationId)),
-        save: async (conversation) => {
-          this.conversations.set(conversation.conversationId, clone(conversation));
-        },
-      },
-      states: {
-        getByConversationId: async (conversationId) => clone(this.states.get(conversationId)),
-        save: async (state) => {
-          this.states.set(state.conversationId, this.toInternalState(clone(state)));
-        },
-      },
-      events: {
-        append: async (events) => {
-          for (const event of events) {
-            const list = this.events.get(event.conversationId) ?? [];
-            list.push(clone(event));
-            this.events.set(event.conversationId, list);
-          }
-        },
-        listByConversationId: async (conversationId) => clone(this.events.get(conversationId) ?? []),
-      },
-      traces: {
-        save: async (trace) => {
-          const list = this.traces.get(trace.conversationId) ?? [];
-          list.push(clone(trace));
-          this.traces.set(trace.conversationId, list);
-        },
-        listByConversationId: async (conversationId) => clone(this.traces.get(conversationId) ?? []),
-      },
-    };
-  }
-
   private services(): RuntimeServices {
     if (this.serviceModule) return this.serviceModule;
-    const internalServices: RuntimeServices = {
-      stepRegistry: {
-        register: (handler: StepHandler) => {
-          this.options.stepHandlers = { ...(this.options.stepHandlers ?? {}), [handler.stepType]: handler };
-        },
-        getHandler: (stepType: string) => {
-          const handler = this.options.stepHandlers?.[stepType];
-          if (!handler) throw this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${stepType} is not registered.`, false);
-          return handler;
-        },
-        hasHandler: (stepType: string) => builtInStepTypes.has(stepType) || Boolean(this.options.stepHandlers?.[stepType]),
-      },
-      operationExecutor: {
-        executeMany: async () => {
-          throw this.runtimeError("OPERATION_EXECUTION_CONTEXT_REQUIRED", "Use ConversationEngine to execute operations with a full turn context.", false);
-        },
-      },
-      inputProcessor: {
-        process: async () => {
-          throw this.runtimeError("INPUT_PROCESSING_CONTEXT_REQUIRED", "Use ConversationEngine to process input with a full turn context.", false);
-        },
-      },
-      responseRenderer: {
-        render: async () => {
-          throw this.runtimeError("RESPONSE_RENDERING_CONTEXT_REQUIRED", "Use ConversationEngine to render responses with a full turn context.", false);
-        },
-      },
-      actionExecutor: {
-        execute: async (action: ActionDefinition, input: Record<string, unknown>, context: ActionExecutionContext) => {
-          const handler = this.options.actionHandlers?.[action.kind];
-          if (!handler) throw this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false);
-          return typeof handler === "function" ? handler(action, input, context) : handler.execute(action, input, context);
-        },
-      },
-      conditionEvaluator: {
-        evaluate: async (condition, context) => ({
-          matched: this.evaluateCondition(this.conditionEvaluationContext(context), condition),
-        }),
-      },
-      transitionResolver: {
-        resolveFromStepResult: async (step: StepDefinition, result: StepResult) => result.branch ?? (result.outcome ? this.resolveRoute(step, result.outcome) : undefined),
-        resolveFromOutcome: async (step: StepDefinition, outcome: string) => this.resolveRoute(step, outcome),
-      },
-      stateReducer: {
-        apply: (state: ConversationState) => state,
-      },
-      traceBuilder: {
-        build: (input: TraceBuildInput) => ({
-          traceId: this.newId("newTraceId", "trace"),
-          createdAt: this.clock.now(),
-          ...input,
-        }),
-      },
-      semanticInputResolver: typeof this.options.semanticInputResolver === "function"
-        ? { resolve: this.options.semanticInputResolver }
-        : this.options.semanticInputResolver,
-      llmResponseGenerator: typeof this.options.llmResponseGenerator === "function"
-        ? { generate: this.options.llmResponseGenerator }
-        : this.options.llmResponseGenerator,
-    };
+    const internalServices = createRuntimeServices({
+      options: this.options,
+      runtimeError: (code, message, recoverable) => this.runtimeError(code, message, recoverable),
+      evaluateCondition: (condition, context) => this.evaluateCondition(this.conditionEvaluationContext(context), condition),
+      resolveRoute: (step, outcome) => this.resolveRoute(step, outcome),
+      newTraceId: () => this.newId("newTraceId", "trace"),
+      now: () => this.clock.now(),
+    });
     this.serviceModule = { ...internalServices, ...(this.options.services ?? {}) };
     return this.serviceModule;
   }
@@ -2091,24 +1888,28 @@ class Runtime {
     return this.idGenerator[method]?.() ?? `${prefix}-${Math.random().toString(36).slice(2)}`;
   }
 
+  private baseExecutionContext(context: TurnContext, step: StepDefinition): ActionExecutionContext {
+    return { flow: context.flow, step, state: context.state, turn: context.turn };
+  }
+
   private stepContext(context: TurnContext, step: StepDefinition): StepExecutionContext {
-    return { flow: context.flow, step, config: step.config, state: context.state, turn: context.turn, services: this.services() };
+    return { ...this.baseExecutionContext(context, step), config: step.config, services: this.services() };
   }
 
   private inputContext(context: TurnContext, step: StepDefinition): InputProcessingContext {
-    return { flow: context.flow, step, state: context.state, turn: context.turn };
+    return this.baseExecutionContext(context, step);
   }
 
   private responseContext(context: TurnContext, step: StepDefinition): ResponseRenderingContext {
-    return { flow: context.flow, step, state: context.state, turn: context.turn, channel: context.conversation.channel };
+    return { ...this.baseExecutionContext(context, step), channel: context.conversation.channel };
   }
 
   private operationContext(context: TurnContext, step: StepDefinition): OperationExecutionContext {
-    return { flow: context.flow, step, state: context.state, turn: context.turn, services: this.services() };
+    return { ...this.baseExecutionContext(context, step), services: this.services() };
   }
 
   private actionContext(context: TurnContext, step: StepDefinition): ActionExecutionContext {
-    return { flow: context.flow, step, state: context.state, turn: context.turn };
+    return this.baseExecutionContext(context, step);
   }
 
   private conditionEvaluationContext(context: Parameters<RuntimeServices["conditionEvaluator"]["evaluate"]>[1]): TurnContext {
@@ -2200,29 +2001,4 @@ class Runtime {
       error: result.error,
     };
   }
-}
-
-function emptyRendered(): RenderedOutput {
-  return { messages: [], events: [], fragments: [] };
-}
-
-function clone<T>(value: T): T {
-  if (value === undefined) return value;
-  return structuredClone(value) as T;
-}
-
-function isLlmGeneratedResponse(value: LlmGeneratedResponse | unknown): value is LlmGeneratedResponse {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as { text?: unknown; usedVariableIds?: unknown };
-  return typeof candidate.text === "string" && Array.isArray(candidate.usedVariableIds);
-}
-
-function isScopedInitialVariables(value: unknown): value is Partial<Record<VariableScope, Record<VariableId, unknown>>> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const candidate = value as Partial<Record<VariableScope, unknown>>;
-  return ["conversation", "flow", "operation", "system"].some((scope) => scope in candidate);
-}
-
-function isVariableScope(value: string): value is VariableScope {
-  return value === "conversation" || value === "flow" || value === "operation" || value === "system";
 }
