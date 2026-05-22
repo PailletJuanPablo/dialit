@@ -10,7 +10,10 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "demo:web": "npm --prefix examples/web-chatbot run dev -- --port 5173",
+    "demo:web:build": "npm --prefix examples/web-chatbot run build",
+    "demo:web:test": "npm --prefix examples/web-chatbot test -- --run"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",
