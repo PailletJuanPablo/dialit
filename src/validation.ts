@@ -80,7 +80,12 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 addIssue("GENERATED_RESPONSE_REQUIRES_FALLBACK", "Generated response plans require fallbackText.", entityId);
             }
 
-            for (const variableId of plan.allowedVariableIds ?? []) {
+            if (!Array.isArray(plan.allowedVariableIds)) {
+                addIssue("GENERATED_RESPONSE_REQUIRES_ALLOWED_VARIABLES", "Generated response plans require allowedVariableIds.", entityId);
+                return;
+            }
+
+            for (const variableId of plan.allowedVariableIds) {
                 checkVariable(variableId, entityId);
             }
         }
@@ -184,12 +189,10 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 }
                 return;
             case "call_flow":
-                for (const [variableId, expression] of Object.entries(operation.inputMapping ?? {})) {
-                    checkVariable(variableId, entityId);
+                for (const expression of Object.values(operation.inputMapping ?? {})) {
                     checkValueExpression(expression, entityId);
                 }
-                for (const [sourceVariableId, targetVariableId] of Object.entries(operation.outputMapping ?? {})) {
-                    checkVariable(sourceVariableId, entityId);
+                for (const targetVariableId of Object.values(operation.outputMapping ?? {})) {
                     checkVariable(targetVariableId, entityId);
                 }
                 for (const variableId of operation.variableSharing?.includeVariableIds ?? []) {

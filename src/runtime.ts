@@ -881,16 +881,29 @@ class Runtime {
   private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
     const childFlow = await this.getFlowVersion(operation.flowVersionId);
     if (!childFlow) return { status: "failed", error: this.runtimeError("FLOW_VERSION_NOT_FOUND", `Flow version ${operation.flowVersionId} was not found.`, false) };
+    const input = this.resolveMapping(context, operation.inputMapping ?? {});
+    if (context.error) return { status: "failed", error: context.error };
+    const parentFrame = this.captureFlowCallFrame(context.state);
     const beforeScopedVariables = clone(context.state.scopedVariables);
     const sharing = this.flowCallSharingPolicy(operation);
     const childContext: TurnContext = { ...context, flow: childFlow, nested: true, initialStepId: childFlow.definition.startStepId };
     childContext.state.currentStepId = childFlow.definition.startStepId;
     childContext.state.status = "active";
+    for (const [variableId, value] of Object.entries(input)) {
+      this.applyPatch(childContext, { type: "set", variableId, value, source: "flow_call" } as any);
+    }
     context.events.push(this.event(context, "flow_call_started", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId }));
     await this.runAutomaticSteps(childContext);
     const afterScopedVariables = clone(context.state.scopedVariables);
+    if (childContext.error) {
+      this.restoreFlowCallVariables(context.state, beforeScopedVariables, beforeScopedVariables, sharing);
+      this.restoreFlowCallFrame(context.state, parentFrame);
+      return { status: "failed", error: childContext.error };
+    }
+    const output = this.flowCallOutputPatches(context, childFlow, operation.outputMapping ?? {}, afterScopedVariables, operation.operationId);
     const sharingResult = this.restoreFlowCallVariables(context.state, beforeScopedVariables, afterScopedVariables, sharing);
-    if (childContext.error) return { status: "failed", error: childContext.error };
+    this.restoreFlowCallFrame(context.state, parentFrame);
+    if (output.error) return { status: "failed", error: output.error };
     context.state.status = "active";
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: "completed" }));
     const result = { status: "completed", outcome: "completed" };
@@ -899,6 +912,7 @@ class Runtime {
       status: "completed",
       outcome: "completed",
       branch,
+      patches: output.patches,
       fragments: [{
         source: "operation:call_flow",
         data: {
@@ -906,9 +920,24 @@ class Runtime {
           flowVersionId: childFlow.flowVersionId,
           sharedVariables: sharingResult.sharedVariables,
           isolatedVariables: sharingResult.isolatedVariables,
+          outputVariables: output.outputVariables,
         },
       }],
     };
+  }
+
+  private captureFlowCallFrame(state: InternalState): Pick<InternalState, "currentStepId" | "status" | "pendingInput"> {
+    return {
+      currentStepId: state.currentStepId,
+      status: state.status,
+      pendingInput: clone(state.pendingInput),
+    };
+  }
+
+  private restoreFlowCallFrame(state: InternalState, frame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">): void {
+    state.currentStepId = frame.currentStepId;
+    state.status = frame.status;
+    state.pendingInput = clone(frame.pendingInput);
   }
 
   private flowCallSharingPolicy(operation: any): { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> } {
@@ -964,6 +993,39 @@ class Runtime {
     if (sharing.exclude.has(variableId)) return false;
     if (sharing.include && !sharing.include.has(variableId)) return false;
     return true;
+  }
+
+  private flowCallOutputPatches(
+    parentContext: TurnContext,
+    childFlow: FlowVersion,
+    outputMapping: Record<string, string>,
+    childScopedVariables: InternalState["scopedVariables"],
+    operationId?: string,
+  ): { patches: VariablePatch[]; outputVariables: string[]; error?: RuntimeError } {
+    const patches: VariablePatch[] = [];
+    const outputVariables: string[] = [];
+    for (const [sourceVariableId, targetVariableId] of Object.entries(outputMapping)) {
+      const targetError = this.ensureVariable(parentContext.flow, targetVariableId);
+      if (targetError) return { patches, outputVariables, error: targetError };
+      const sourceScope = this.variableScope(childFlow, sourceVariableId);
+      const sourceValue = childScopedVariables[this.scopedKey(sourceScope, sourceVariableId)];
+      if (!sourceValue) {
+        return {
+          patches,
+          outputVariables,
+          error: this.missingVariableError(childFlow, sourceVariableId, sourceScope),
+        };
+      }
+      patches.push({
+        type: "set",
+        variableId: targetVariableId,
+        value: sourceValue.value,
+        source: "flow_call",
+        metadata: { operationId, sourceVariableId },
+      } as any);
+      outputVariables.push(targetVariableId);
+    }
+    return { patches, outputVariables: outputVariables.sort() };
   }
 
   private async executeHandoff(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
@@ -1132,7 +1194,13 @@ class Runtime {
         const filteredContext = { ...this.responseContext(context, step), state: this.filterStateForGeneratedResponse(context.state, plan.allowedVariableIds ?? []) };
         const generated = await generator.generate(plan, filteredContext as any);
         const allowedVariableIds = new Set<string>((plan.allowedVariableIds ?? []).map(String));
-        const usedVariableIds = typeof generated === "string" ? [] : ((generated as any).usedVariableIds ?? []).map(String);
+        if (typeof generated === "string" || !Array.isArray((generated as any).usedVariableIds)) {
+          context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "LLM_RESPONSE_USAGE_NOT_DECLARED" }));
+          context.llmUsage.push({ purpose: "response_generation", success: false });
+          this.attachError(context, "LLM_RESPONSE_USAGE_NOT_DECLARED", "Generated response must declare usedVariableIds.", false);
+          return emptyRendered();
+        }
+        const usedVariableIds = (generated as any).usedVariableIds.map(String);
         const disallowedVariableId = usedVariableIds.find((variableId: string) => !allowedVariableIds.has(variableId));
         if (disallowedVariableId) {
           context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "invalid_generated_response_variable", variableId: disallowedVariableId }));

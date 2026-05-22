@@ -241,7 +241,10 @@ describe("Nexembot v0.1 reference scenarios", () => {
   });
 
   it("renders generated responses through the constrained generator and requires declared fallbacks", async () => {
-    const llmResponseGenerator = vi.fn(async () => "Your ticket 123 is still being reviewed.");
+    const llmResponseGenerator = vi.fn(async () => ({
+      text: "Your ticket 123 is still being reviewed.",
+      usedVariableIds: ["ticketId"],
+    }));
     const runtime = engineWith(generatedResponseFlow(), { llmResponseGenerator });
 
     const result = await runtime.startConversation({
@@ -601,6 +604,7 @@ describe("Nexembot v0.1 model validation", () => {
     ["missing variable", missingVariableFlow().definition, "VARIABLE_NOT_FOUND"],
     ["bad condition expression", badConditionExpressionFlow().definition, "INVALID_CONDITION_EXPRESSION"],
     ["generated response without fallback", generatedResponseWithoutFallbackFlow().definition, "GENERATED_RESPONSE_REQUIRES_FALLBACK"],
+    ["generated response without allowed variables", generatedResponseWithoutAllowedVariablesFlow().definition, "GENERATED_RESPONSE_REQUIRES_ALLOWED_VARIABLES"],
     ["semantic task without allowed outcomes", semanticWithoutOutcomesFlow().definition, "SEMANTIC_TASK_REQUIRES_ALLOWED_OUTCOMES"],
     ["condition outside ConditionStep", routeConditionFlow().definition, "CONDITION_OUTSIDE_CONDITION_STEP"],
   ])("rejects %s", (_name, flow, code) => {
@@ -864,6 +868,53 @@ describe("Nexembot v0.1 spec regression coverage", () => {
       variableId: "privateNote",
       allowedVariableIds: ["ticketId"],
     });
+  });
+
+  it("rejects generated responses that omit used variable declarations", async () => {
+    const runtime = engineWith(generatedResponseFlow(), {
+      llmResponseGenerator: async () => ({
+        text: "Leaked private note: secret.",
+      }),
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-generated-missing-usage",
+      flowVersionId: "generated-v1",
+      initialVariables: { ticketId: "123", privateNote: "secret" },
+    });
+
+    expect(texts(result)).toEqual([]);
+    expectStructuredFailure(result, "LLM_RESPONSE_USAGE_NOT_DECLARED");
+  });
+
+  it("maps variables into and out of called flows without leaking child state", async () => {
+    const runtime = engineWith(mappedFlowParent(), {
+      flowVersions: [mappedFlowChild()],
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-mapped-flow-call",
+      flowVersionId: "mapped-flow-parent-v1",
+      initialVariables: { parentInput: "mapped-value" },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "parentOutput")).toBe("mapped-value");
+    expect(result.state.currentStepId).toBe("done");
+    expect(texts(result)).toContain("Output mapped-value.");
+    expect(variableValue(result, "childInput")).toBeUndefined();
+    expect(variableValue(result, "childOutput")).toBeUndefined();
+    expect(result.trace.fragments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "operation:call_flow",
+          data: expect.objectContaining({
+            sharedVariables: [],
+            outputVariables: ["parentOutput"],
+          }),
+        }),
+      ]),
+    );
   });
 
   it("honors injected repositories, config, runtime, and exposes services in custom contexts", async () => {
@@ -1616,6 +1667,18 @@ function generatedResponseWithoutFallbackFlow(): FlowVersion {
   });
 }
 
+function generatedResponseWithoutAllowedVariablesFlow(): FlowVersion {
+  const flow = generatedResponseFlow();
+  const step = flow.definition.steps[0] as { config: { messages: Array<Record<string, unknown>> } };
+  delete step.config.messages[0].allowedVariableIds;
+  return flowVersion("generated-no-allowed-variables-v1", {
+    ...flow.definition,
+    flowId: "generated-no-allowed-variables",
+    startStepId: "generated_message",
+    steps: flow.definition.steps,
+  });
+}
+
 function semanticWithoutOutcomesFlow(): FlowVersion {
   const flow = semanticOnlyFlow();
   const step = flow.definition.steps[0] as { config: { input: { semanticTasks: Array<Record<string, unknown>> } } };
@@ -1873,6 +1936,69 @@ function variableSharingChildFlow(): FlowVersion {
       messageStep("write_secret", [], {
         autoAdvance: true,
         onEnter: [setVariable("secret", "child-secret", "flow_call")],
+        routes: [route("next", branch({ target: endTarget("completed") }))],
+      }),
+    ],
+  });
+}
+
+function mappedFlowParent(): FlowVersion {
+  return flowVersion("mapped-flow-parent-v1", {
+    flowId: "mapped-flow-parent",
+    startStepId: "call_child",
+    variables: [
+      variable("parentInput", "string", "conversation"),
+      variable("parentOutput", "string", "conversation"),
+    ],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "call_flow",
+            operationId: "call_mapped_child",
+            flowVersionId: "mapped-flow-child-v1",
+            inputMapping: {
+              childInput: variableRef("parentInput"),
+            },
+            outputMapping: {
+              childOutput: "parentOutput",
+            },
+            variableSharing: {
+              scopes: [],
+            },
+            onResult: [
+              {
+                match: { type: "outcome", outcome: "completed" },
+                branch: branch({ target: stepTarget("done") }),
+              },
+            ],
+          },
+        ],
+      }),
+      messageStep("done", [{ mode: "template", template: "Output {{parentOutput}}.", variableIds: ["parentOutput"] }]),
+    ],
+  });
+}
+
+function mappedFlowChild(): FlowVersion {
+  return flowVersion("mapped-flow-child-v1", {
+    flowId: "mapped-flow-child",
+    startStepId: "copy",
+    variables: [
+      variable("childInput", "string", "conversation"),
+      variable("childOutput", "string", "conversation"),
+    ],
+    steps: [
+      messageStep("copy", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "set_variable",
+            variableId: "childOutput",
+            value: variableRef("childInput"),
+          },
+        ],
         routes: [route("next", branch({ target: endTarget("completed") }))],
       }),
     ],

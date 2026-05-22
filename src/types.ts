@@ -1453,6 +1453,7 @@ export type OperationalRuntimeErrorCode =
     | "INPUT_PROCESSING_CONTEXT_REQUIRED"
     | "INVALID_TARGET"
     | "LLM_RESPONSE_GENERATOR_NOT_REGISTERED"
+    | "LLM_RESPONSE_USAGE_NOT_DECLARED"
     | "MAX_STEP_EXECUTIONS_EXCEEDED"
     | "OPERATION_EXECUTION_CONTEXT_REQUIRED"
     | "OPERATION_HANDLER_NOT_REGISTERED"
@@ -1634,7 +1635,7 @@ export interface LlmResponseGenerator {
 
 export interface LlmGeneratedResponse<TVariableId extends VariableId = VariableId> {
     text: string;
-    usedVariableIds?: readonly TVariableId[];
+    usedVariableIds: readonly TVariableId[];
     fallbackUsed?: boolean;
     usage?: LlmUsageRecord;
     metadata?: Metadata;
