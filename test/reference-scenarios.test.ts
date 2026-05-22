@@ -353,14 +353,16 @@ describe("Nexembot v0.1 reference scenarios", () => {
   });
 
   it("executes custom operations only through explicit contracts and routes their results", async () => {
-    const customOperation = vi.fn(async () => ({
+    const customOperation = vi.fn(async (_operation: unknown, _input: unknown, context: unknown) => ({
       status: "completed",
       outcome: "accepted",
       variablePatches: [
         {
           type: "set",
           variableId: "auditStatus",
-          value: "accepted",
+          value: (context as { services?: { stepRegistry?: { hasHandler(stepType: string): boolean } } }).services?.stepRegistry?.hasHandler("message")
+            ? "accepted"
+            : "missing-services",
           source: "operation",
         },
       ],
@@ -563,7 +565,7 @@ describe("Nexembot v0.1 no-silent-fallback guarantees", () => {
     ["missing operation handler", unknownOperationFlow(), "OPERATION_HANDLER_NOT_REGISTERED"],
     ["missing action handler", actionFlow(), "ACTION_HANDLER_NOT_REGISTERED"],
     ["missing response", missingResponseFlow(), "RESPONSE_NOT_FOUND"],
-    ["missing variable", missingVariableFlow(), "VARIABLE_NOT_FOUND"],
+    ["missing variable", missingVariableFlow(), "missing_variable_reference"],
     ["missing action", missingActionFlow(), "ACTION_NOT_FOUND"],
     ["missing flow version", missingFlowCallFlow(), "FLOW_VERSION_NOT_FOUND"],
     ["missing LLM generator", generatedResponseFlow(), "LLM_RESPONSE_GENERATOR_NOT_REGISTERED"],
@@ -704,7 +706,11 @@ describe("Nexembot v0.1 spec regression coverage", () => {
       flowVersionId: "missing-template-variable-v1",
     });
 
-    expectStructuredFailure(result, "VARIABLE_NOT_FOUND");
+    expectStructuredFailure(result, "missing_variable_reference");
+    expect(result.error).toMatchObject({
+      variableId: "missingName",
+      scope: "conversation",
+    });
   });
 
   it("fails loudly when an operation value references a missing variable", async () => {
@@ -713,7 +719,11 @@ describe("Nexembot v0.1 spec regression coverage", () => {
       flowVersionId: "missing-expression-variable-v1",
     });
 
-    expectStructuredFailure(result, "VARIABLE_NOT_FOUND");
+    expectStructuredFailure(result, "missing_variable_reference");
+    expect(result.error).toMatchObject({
+      variableId: "missingSource",
+      scope: "conversation",
+    });
   });
 
   it("fails loudly for unknown validators instead of accepting invalid input", async () => {
@@ -729,6 +739,171 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     });
 
     expectStructuredFailure(result, "VALIDATOR_NOT_REGISTERED");
+  });
+
+  it("honors injected repositories, config, runtime, and exposes services in custom contexts", async () => {
+    const savedConversations: unknown[] = [];
+    const appendedEvents: unknown[] = [];
+    const runtimeNow = "2026-05-22T13:00:00.000Z";
+    const runtime = engineWith(compositionFlow(), {
+      config: { defaultLocale: "en", maxStepExecutionsPerTurn: 7 },
+      runtime: {
+        config: { defaultChannel: "telegram" },
+        clock: { now: () => runtimeNow },
+      },
+      repositories: {
+        conversations: {
+          getById: async (conversationId: string) => savedConversations.find((conversation) => (
+            conversation as { conversationId?: string }
+          ).conversationId === conversationId) as never,
+          save: async (conversation: unknown) => {
+            savedConversations.push(conversation);
+          },
+        },
+        events: {
+          append: async (events: unknown[]) => {
+            appendedEvents.push(...events);
+          },
+          listByConversationId: async (conversationId: string) => appendedEvents.filter((event) => (
+            event as { conversationId?: string }
+          ).conversationId === conversationId) as never,
+        },
+      },
+    });
+
+    expect(runtime.runtime.config).toMatchObject({
+      defaultChannel: "telegram",
+      defaultLocale: "en",
+      maxStepExecutionsPerTurn: 7,
+    });
+    expect(runtime.runtime.clock.now()).toBe(runtimeNow);
+    expect(runtime.services.stepRegistry.hasHandler("message")).toBe(true);
+    expect(runtime.services.stepRegistry.hasHandler("composition_step")).toBe(false);
+
+    runtime.services.stepRegistry.register({
+      stepType: "composition_step",
+      validate: () => [],
+      enter: async (context: unknown) => ({
+        status: "completed",
+        outcome: "done",
+        variablePatches: [
+          {
+            type: "set",
+            variableId: "serviceSeen",
+            value: Boolean((context as { services?: unknown }).services),
+            source: "operation",
+          },
+        ],
+        trace: { source: "custom_step:composition_step" },
+      }),
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-composition",
+      flowVersionId: "composition-v1",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "serviceSeen")).toBe(true);
+    expect(savedConversations).toEqual([
+      expect.objectContaining({ conversationId: "conversation-composition" }),
+    ]);
+    expect(await runtime.repositories.events.listByConversationId("conversation-composition")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "conversation_started" }),
+      ]),
+    );
+    expect(await runtime.repositories.conversations.getById("conversation-composition")).toMatchObject({
+      conversationId: "conversation-composition",
+    });
+  });
+
+  it("returns public structured missing_variable_reference errors with details", async () => {
+    const result = await engineWith(missingTemplateVariableFlow()).startConversation({
+      conversationId: "conversation-public-error",
+      flowVersionId: "missing-template-variable-v1",
+    });
+
+    expect(result.error).toMatchObject({
+      code: "missing_variable_reference",
+      variableId: "missingName",
+      scope: "conversation",
+      recoverable: false,
+    });
+  });
+
+  it("supports semantic menu selection through declared policy", async () => {
+    const semanticInputResolver = vi.fn(async () => ({
+      outcome: "billing",
+      confidence: 0.91,
+      variables: {},
+    }));
+    const runtime = engineWith(semanticMenuFlow(), { semanticInputResolver });
+    await runtime.startConversation({
+      conversationId: "conversation-semantic-menu",
+      flowVersionId: "semantic-menu-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-semantic-menu",
+      input: textInput("conversation-semantic-menu", "I need help with an invoice"),
+    });
+
+    expect(semanticInputResolver).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "I need help with an invoice" }),
+      expect.objectContaining({
+        mode: "menu_selection",
+        allowedOutcomes: ["billing", "technical"],
+        allowedVariableIds: [],
+        threshold: 0.75,
+      }),
+      expect.any(Object),
+    );
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "contactReason")).toBe("billing");
+    expect(result.state.status).toBe("completed");
+    expect(traceSources(result)).toEqual(expect.arrayContaining(["menu:resolve"]));
+  });
+
+  it("fails loudly when semantic menu selection is enabled without a resolver", async () => {
+    const runtime = engineWith(semanticMenuFlow());
+    await runtime.startConversation({
+      conversationId: "conversation-semantic-menu-missing-resolver",
+      flowVersionId: "semantic-menu-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-semantic-menu-missing-resolver",
+      input: textInput("conversation-semantic-menu-missing-resolver", "I need help with an invoice"),
+    });
+
+    expectStructuredFailure(result, "SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED");
+    expect(variableValue(result, "contactReason")).toBeUndefined();
+  });
+
+  it("routes free-text menu input only when the policy explicitly allows it", async () => {
+    const runtime = engineWith(freeTextMenuFlow());
+    await runtime.startConversation({
+      conversationId: "conversation-free-text-menu",
+      flowVersionId: "free-text-menu-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-free-text-menu",
+      input: textInput("conversation-free-text-menu", "Something else"),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "contactReason")).toBe("free_text");
+    expect(result.state.status).toBe("completed");
+    expect(result.trace.fragments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "menu:resolve",
+          data: expect.objectContaining({ resolver: "free_text" }),
+        }),
+      ]),
+    );
   });
 });
 
@@ -1460,6 +1635,100 @@ function unknownValidatorFlow(): FlowVersion {
         validators: [{ type: "not_registered_validator" }],
         routes: [route("captured", branch({ target: endTarget("completed") }))],
       }),
+    ],
+  });
+}
+
+function compositionFlow(): FlowVersion {
+  return flowVersion("composition-v1", {
+    flowId: "composition",
+    startStepId: "custom",
+    variables: [variable("serviceSeen", "boolean", "conversation")],
+    steps: [
+      {
+        stepId: "custom",
+        type: "custom",
+        config: { customType: "composition_step", payload: {} },
+        routes: [route("done", branch({ target: endTarget("completed") }))],
+      },
+    ],
+  });
+}
+
+function semanticMenuFlow(): FlowVersion {
+  return flowVersion("semantic-menu-v1", {
+    flowId: "semantic-menu",
+    startStepId: "semantic_menu",
+    variables: [variable("contactReason", "string", "conversation")],
+    steps: [
+      {
+        stepId: "semantic_menu",
+        type: "menu",
+        config: {
+          prompt: staticText("How can we help?"),
+          options: [
+            option("billing", "Billing", ["invoice"], branch({
+              operations: [setVariable("contactReason", "billing", "menu_selection")],
+              target: endTarget("completed"),
+            })),
+            option("technical", "Technical", ["tech"], branch({
+              operations: [setVariable("contactReason", "technical", "menu_selection")],
+              target: endTarget("completed"),
+            })),
+          ],
+          selection: {
+            allowNumbers: false,
+            allowExactText: false,
+            allowAliases: false,
+            allowButtons: true,
+            allowFreeText: true,
+            semanticSelection: {
+              enabled: true,
+              threshold: 0.75,
+            },
+          },
+          invalidSelection: {
+            message: staticText("Please choose a listed option."),
+            target: { type: "stay" },
+          },
+        },
+      },
+    ],
+  });
+}
+
+function freeTextMenuFlow(): FlowVersion {
+  return flowVersion("free-text-menu-v1", {
+    flowId: "free-text-menu",
+    startStepId: "free_text_menu",
+    variables: [variable("contactReason", "string", "conversation")],
+    steps: [
+      {
+        stepId: "free_text_menu",
+        type: "menu",
+        config: {
+          prompt: staticText("Choose or type."),
+          options: [
+            option("billing", "Billing", [], branch({
+              operations: [setVariable("contactReason", "billing", "menu_selection")],
+              target: endTarget("completed"),
+            })),
+          ],
+          selection: {
+            allowButtons: false,
+            allowNumbers: false,
+            allowExactText: false,
+            allowAliases: false,
+            allowFreeText: true,
+          },
+        },
+        routes: [
+          route("free_text", branch({
+            operations: [setVariable("contactReason", "free_text", "menu_selection")],
+            target: endTarget("completed"),
+          })),
+        ],
+      },
     ],
   });
 }

@@ -4,13 +4,16 @@ import type {
   Conversation,
   ConversationEngine,
   ConversationEngineModule,
+  ConversationEngineRepositories,
   ConversationEvent,
+  ConversationEngineConfig,
   CreateConversationEngineOptions,
   ConversationState,
   DecisionTrace,
   FlowVersion,
   OutboundMessage,
   ProcessTurnResult,
+  RuntimeContext,
   RuntimeError,
   RuntimeServices,
   StepBranch,
@@ -95,13 +98,17 @@ class Runtime {
   private readonly states = new Map<string, InternalState>();
   private readonly events = new Map<string, ConversationEvent[]>();
   private readonly traces = new Map<string, DecisionTrace[]>();
+  private readonly internalRepositories: ConversationEngineRepositories;
+  private readonly repositories: ConversationEngineRepositories;
+  private readonly runtimeContext: RuntimeContext;
   private readonly clock: { now(): string };
   private readonly idGenerator: Record<string, () => string>;
   private readonly maxStepExecutionsPerTurn: number;
+  private serviceModule?: RuntimeServices;
 
   constructor(private readonly options: EngineOptions) {
     for (const flowVersion of options.flowVersions ?? []) this.flowVersions.set(flowVersion.flowVersionId, flowVersion);
-    this.clock = options.clock ?? { now: () => new Date().toISOString() };
+    this.clock = options.runtime?.clock ?? options.clock ?? { now: () => new Date().toISOString() };
     let counter = 0;
     const next = (prefix: string) => `${prefix}-${++counter}`;
     this.idGenerator = {
@@ -113,54 +120,86 @@ class Runtime {
       newCandidateId: () => next("candidate"),
       newExecutionFrameId: () => next("frame"),
       newHandoffId: () => next("handoff"),
+      ...(options.runtime?.idGenerator as Record<string, () => string> | undefined),
       ...(options.idGenerator as Record<string, () => string> | undefined),
     };
-    this.maxStepExecutionsPerTurn = options.maxStepExecutionsPerTurn ?? 20;
+    const config: ConversationEngineConfig = {
+      ...(options.runtime?.config ?? {}),
+      ...(options.config ?? {}),
+    };
+    this.maxStepExecutionsPerTurn = config.maxStepExecutionsPerTurn ?? options.maxStepExecutionsPerTurn ?? 20;
+    this.internalRepositories = this.createInternalRepositories();
+    this.repositories = {
+      flowVersions: options.repositories?.flowVersions ?? this.internalRepositories.flowVersions,
+      conversations: options.repositories?.conversations ?? this.internalRepositories.conversations,
+      states: options.repositories?.states ?? this.internalRepositories.states,
+      events: options.repositories?.events ?? this.internalRepositories.events,
+      traces: options.repositories?.traces ?? this.internalRepositories.traces,
+    };
+    this.runtimeContext = {
+      config: {
+        ...config,
+        maxStepExecutionsPerTurn: this.maxStepExecutionsPerTurn,
+      },
+      clock: this.clock,
+      idGenerator: this.idGenerator as any,
+    };
   }
 
   engine(): ConversationEngine & ConversationEngineModule {
     return {
       startConversation: (request) => this.startConversation(request),
       processUserInput: (request) => this.processUserInput(request),
-      repositories: {
-        flowVersions: {
-          getById: async (flowVersionId) => this.flowVersions.get(flowVersionId),
-          save: async (flowVersion) => { this.flowVersions.set(flowVersion.flowVersionId, flowVersion); },
-        },
-        conversations: {
-          getById: async (conversationId) => clone(this.conversations.get(conversationId)),
-          save: async (conversation) => { this.conversations.set(conversation.conversationId, clone(conversation)); },
-        },
-        states: {
-          getByConversationId: async (conversationId) => clone(this.states.get(conversationId)) as any,
-          save: async (state) => { this.states.set(state.conversationId, clone(state as unknown as InternalState)); },
-        },
-        events: {
-          append: async (events) => {
-            for (const event of events) {
-              const list = this.events.get(event.conversationId) ?? [];
-              list.push(clone(event));
-              this.events.set(event.conversationId, list);
-            }
-          },
-          listByConversationId: async (conversationId) => clone(this.events.get(conversationId) ?? []),
-        },
-        traces: {
-          save: async (trace) => {
-            const list = this.traces.get(trace.conversationId) ?? [];
-            list.push(clone(trace));
-            this.traces.set(trace.conversationId, list);
-          },
-          listByConversationId: async (conversationId) => clone(this.traces.get(conversationId) ?? []),
+      repositories: this.repositories,
+      services: this.services(),
+      runtime: this.runtimeContext,
+    };
+  }
+
+  private createInternalRepositories(): ConversationEngineRepositories {
+    return {
+      flowVersions: {
+        getById: async (flowVersionId) => clone(this.flowVersions.get(flowVersionId)),
+        save: async (flowVersion) => {
+          this.flowVersions.set(flowVersion.flowVersionId, clone(flowVersion));
         },
       },
-      services: this.services(),
-      runtime: { config: {}, clock: this.clock, idGenerator: this.idGenerator as any },
+      conversations: {
+        getById: async (conversationId) => clone(this.conversations.get(conversationId)),
+        save: async (conversation) => {
+          this.conversations.set(conversation.conversationId, clone(conversation));
+        },
+      },
+      states: {
+        getByConversationId: async (conversationId) => clone(this.states.get(conversationId)) as any,
+        save: async (state) => {
+          this.states.set(state.conversationId, clone(state as unknown as InternalState));
+        },
+      },
+      events: {
+        append: async (events) => {
+          for (const event of events) {
+            const list = this.events.get(event.conversationId) ?? [];
+            list.push(clone(event));
+            this.events.set(event.conversationId, list);
+          }
+        },
+        listByConversationId: async (conversationId) => clone(this.events.get(conversationId) ?? []),
+      },
+      traces: {
+        save: async (trace) => {
+          const list = this.traces.get(trace.conversationId) ?? [];
+          list.push(clone(trace));
+          this.traces.set(trace.conversationId, list);
+        },
+        listByConversationId: async (conversationId) => clone(this.traces.get(conversationId) ?? []),
+      },
     };
   }
 
   private services(): RuntimeServices {
-    return {
+    if (this.serviceModule) return this.serviceModule;
+    const internalServices: RuntimeServices = {
       stepRegistry: {
         register: (handler: any) => {
           this.options.stepHandlers = { ...(this.options.stepHandlers ?? {}), [handler.stepType]: handler };
@@ -218,10 +257,12 @@ class Runtime {
         ? { generate: this.options.llmResponseGenerator as any }
         : this.options.llmResponseGenerator,
     };
+    this.serviceModule = { ...internalServices, ...(this.options.services ?? {}) };
+    return this.serviceModule;
   }
 
   private async startConversation(request: { conversationId: string; flowVersionId: string; channel?: string; userId?: string; initialVariables?: Record<string, unknown>; metadata?: Record<string, unknown> }): Promise<ProcessTurnResult> {
-    const flow = this.flowVersions.get(request.flowVersionId);
+    const flow = await this.getFlowVersion(request.flowVersionId);
     const conversation = this.createConversation(request, flow);
     const state = this.createInitialState(conversation, flow, request.initialVariables ?? {});
     const turn = this.createTurn(request.conversationId);
@@ -238,9 +279,9 @@ class Runtime {
   }
 
   private async processUserInput(request: { conversationId: string; input: UserInput }): Promise<ProcessTurnResult> {
-    const conversation = this.conversations.get(request.conversationId);
-    const existingState = this.states.get(request.conversationId);
-    const flow = existingState ? this.flowVersions.get(existingState.flowVersionId) : undefined;
+    const conversation = await this.getConversation(request.conversationId);
+    const existingState = await this.getState(request.conversationId);
+    const flow = existingState ? await this.getFlowVersion(existingState.flowVersionId) : undefined;
     const safeConversation = conversation ?? this.createConversation({ conversationId: request.conversationId, flowVersionId: flow?.flowVersionId ?? "unknown" }, flow);
     const safeState = existingState ?? this.createInitialState(safeConversation, flow, {});
     const turn = this.createTurn(request.conversationId, request.input);
@@ -265,10 +306,22 @@ class Runtime {
     context.state.currentStepId = step.stepId;
     context.state.lastUserInput = request.input;
     const result = await this.handleStepInput(context, step, request.input);
-    if (result.error) return this.fail(context, result.error.code, result.error.message, result.error.recoverable);
+    if (result.error) return this.failWithError(context, result.error);
     await this.applyStepResult(context, step, result);
     await this.runAutomaticSteps(context);
     return this.commit(context);
+  }
+
+  private async getFlowVersion(flowVersionId: string): Promise<FlowVersion | undefined> {
+    return this.flowVersions.get(flowVersionId) ?? await this.repositories.flowVersions.getById(flowVersionId);
+  }
+
+  private async getConversation(conversationId: string): Promise<Conversation | undefined> {
+    return this.conversations.get(conversationId) ?? await this.repositories.conversations.getById(conversationId);
+  }
+
+  private async getState(conversationId: string): Promise<InternalState | undefined> {
+    return (this.states.get(conversationId) ?? await this.repositories.states.getByConversationId(conversationId)) as InternalState | undefined;
   }
 
   private async runAutomaticSteps(context: TurnContext): Promise<void> {
@@ -282,7 +335,7 @@ class Runtime {
       context.initialStepId ??= step.stepId;
       const result = await this.enterStep(context, step);
       if (result.error) {
-        this.attachError(context, result.error.code, result.error.message, result.error.recoverable);
+        this.attachRuntimeError(context, result.error);
         return;
       }
       await this.applyStepResult(context, step, result);
@@ -331,7 +384,7 @@ class Runtime {
     if (branch) {
       const branchResult = await this.executeBranch(context, step, branch);
       if (branchResult.error) {
-        this.attachError(context, branchResult.error.code, branchResult.error.message, branchResult.error.recoverable);
+        this.attachRuntimeError(context, branchResult.error);
         return;
       }
       target = branchResult.target ?? target;
@@ -339,7 +392,7 @@ class Runtime {
 
     const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? []);
     if (exitResult.error) {
-      this.attachError(context, exitResult.error.code, exitResult.error.message, exitResult.error.recoverable);
+      this.attachRuntimeError(context, exitResult.error);
       return;
     }
     target = exitResult.target ?? target;
@@ -448,25 +501,71 @@ class Runtime {
     const selection = (step as any).config.selection ?? {};
     let selected: Record<string, any> | undefined;
     let resolver = "unknown";
+    let text: string | undefined;
     if (selection.allowButtons !== false && (input as any).type === "choice" && (input as any).optionId) {
       selected = options.find((option) => option.optionId === (input as any).optionId);
       resolver = "option_id";
     }
     if (!selected && (input as any).type === "text") {
-      const text = String((input as any).text ?? "").trim();
-      const number = Number(text);
+      const inputText = String((input as any).text ?? "").trim();
+      text = inputText;
+      const number = Number(inputText);
       if (selection.allowNumbers !== false && Number.isInteger(number) && number >= 1 && number <= options.length) {
         selected = options[number - 1];
         resolver = "number";
       }
       if (!selected && selection.allowExactText !== false) {
-        selected = options.find((option) => String(option.label ?? "").toLowerCase() === text.toLowerCase());
+        selected = options.find((option) => String(option.label ?? "").toLowerCase() === inputText.toLowerCase());
         resolver = "exact_text";
       }
       if (!selected && selection.allowAliases !== false) {
-        selected = options.find((option) => (option.aliases ?? []).some((alias: string) => alias.toLowerCase() === text.toLowerCase()));
+        selected = options.find((option) => (option.aliases ?? []).some((alias: string) => alias.toLowerCase() === inputText.toLowerCase()));
         resolver = "alias";
       }
+    }
+    if (!selected && text && selection.semanticSelection?.enabled) {
+      const semanticResolver = this.services().semanticInputResolver;
+      if (!semanticResolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
+      const allowedOutcomes = options.map((option) => String(option.optionId));
+      if (selection.semanticSelection.unknownOutcome) allowedOutcomes.push(String(selection.semanticSelection.unknownOutcome));
+      const task = {
+        taskId: `${step.stepId}:menu_selection`,
+        mode: "menu_selection",
+        allowedOutcomes,
+        allowedVariableIds: [],
+        threshold: selection.semanticSelection.threshold,
+      };
+      context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
+      const semantic = await this.callSemanticResolver(semanticResolver, input, task, this.inputContext(context, step));
+      const outcome = String((semantic as any).outcome ?? "");
+      const confidence = Number((semantic as any).confidence ?? 0);
+      const variables = (semantic as any).variables ?? {};
+      if (!allowedOutcomes.includes(outcome)) {
+        return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic outcome ${outcome} is not declared.`, false) };
+      }
+      if (Object.keys(variables).length > 0) {
+        return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", "Menu semantic selection cannot write variables.", false) };
+      }
+      context.events.push(this.event(context, "semantic_input_task_completed", { taskId: task.taskId, outcome, confidence }));
+      context.llmUsage.push({ purpose: "input_resolution", success: true });
+      if (confidence >= selection.semanticSelection.threshold && outcome !== selection.semanticSelection.unknownOutcome) {
+        selected = options.find((option) => String(option.optionId) === outcome);
+        resolver = "semantic_selection";
+      }
+      if (!selected && outcome === selection.semanticSelection.unknownOutcome) {
+        return {
+          status: "completed",
+          outcome,
+          fragments: [{ source: "menu:resolve", data: { resolver: "semantic_selection", outcome, confidence } }],
+        };
+      }
+    }
+    if (!selected && text && selection.allowFreeText) {
+      return {
+        status: "completed",
+        outcome: "free_text",
+        fragments: [{ source: "menu:resolve", data: { resolver: "free_text", text } }],
+      };
     }
     if (!selected) {
       const rendered = await this.renderInvalid(context, step, (step as any).config.invalidSelection);
@@ -497,7 +596,7 @@ class Runtime {
 
     for (const task of contract.semanticTasks ?? []) {
       if (task.mode !== "after_valid_capture") continue;
-      const resolver = this.options.semanticInputResolver;
+      const resolver = this.services().semanticInputResolver;
       if (!resolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
       context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
       const semantic = await this.callSemanticResolver(resolver, input, task, this.inputContext(context, step));
@@ -596,7 +695,7 @@ class Runtime {
   private async resolveSemanticAfterInvalidInput(context: TurnContext, step: StepDefinition): Promise<StepRunResult | undefined> {
     const tasks = ((step as any).config.input?.semanticTasks ?? []).filter((task: any) => task.mode === "after_invalid_input");
     if (tasks.length === 0) return undefined;
-    const resolver = this.options.semanticInputResolver;
+    const resolver = this.services().semanticInputResolver;
     if (!resolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
     const task = tasks[0];
     context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
@@ -705,11 +804,13 @@ class Runtime {
   private async executeAction(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
     const action = (context.flow.definition.actions ?? []).find((candidate: any) => candidate.actionId === operation.actionId) as any;
     if (!action) return { status: "failed", error: this.runtimeError("ACTION_NOT_FOUND", `Action ${operation.actionId} was not found.`, false) };
-    const handler = this.options.actionHandlers?.[action.kind];
-    if (!handler) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
     context.events.push(this.event(context, "action_started", { actionId: action.actionId, actionKind: action.kind }));
-    const result = await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step) as any) : handler.execute(action, input, this.actionContext(context, step) as any)) as any;
+    const handler = this.options.actionHandlers?.[action.kind];
+    if (!handler && !this.options.services?.actionExecutor) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
+    const result = this.options.services?.actionExecutor
+      ? await this.options.services.actionExecutor.execute(action, input, this.actionContext(context, step) as any) as any
+      : await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step) as any) : handler!.execute(action, input, this.actionContext(context, step) as any)) as any;
     const outcome = result.outcome ?? result.status;
     if (action.resultOutcomes && outcome && !action.resultOutcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("ACTION_RESULT_OUT_OF_CONTRACT", `Action outcome ${outcome} is not declared.`, false) };
@@ -760,7 +861,7 @@ class Runtime {
   }
 
   private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
-    const childFlow = this.flowVersions.get(operation.flowVersionId);
+    const childFlow = await this.getFlowVersion(operation.flowVersionId);
     if (!childFlow) return { status: "failed", error: this.runtimeError("FLOW_VERSION_NOT_FOUND", `Flow version ${operation.flowVersionId} was not found.`, false) };
     const isolatedVariables = (childFlow.definition.variables ?? []).filter((variable: any) => (variable.scope ?? "conversation") === "flow").map((variable: any) => variable.variableId);
     const childContext: TurnContext = { ...context, flow: childFlow, nested: true, initialStepId: childFlow.definition.startStepId };
@@ -954,7 +1055,7 @@ class Runtime {
       return this.renderOne(context, step, response.plan);
     }
     if (plan?.mode === "generated") {
-      const generator = this.options.llmResponseGenerator;
+      const generator = this.services().llmResponseGenerator;
       if (!generator) {
         this.attachError(context, "LLM_RESPONSE_GENERATOR_NOT_REGISTERED", "LLM response generator is not registered.", false);
         return emptyRendered();
@@ -962,7 +1063,7 @@ class Runtime {
       context.events.push(this.event(context, "llm_response_generation_started", { stepId: step.stepId }));
       try {
         const filteredContext = { ...this.responseContext(context, step), state: this.filterStateForGeneratedResponse(context.state, plan.allowedVariableIds ?? []) };
-        const generated = await (typeof generator === "function" ? generator(plan, filteredContext as any) : generator.generate(plan, filteredContext as any));
+        const generated = await generator.generate(plan, filteredContext as any);
         const text = typeof generated === "string" ? generated : (generated as any).text;
         context.events.push(this.event(context, "llm_response_generation_completed", { stepId: step.stepId }));
         context.llmUsage.push({ purpose: "response_generation", success: true });
@@ -981,7 +1082,7 @@ class Runtime {
         const variableId = String(name).trim();
         const variable = this.readVariable(context, variableId);
         if (!variable) {
-          this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${variableId} was not found.`, false);
+          this.attachMissingVariableError(context, variableId);
           return "";
         }
         return String(variable.value ?? "");
@@ -1037,7 +1138,7 @@ class Runtime {
     if (expression.type === "variable") {
       const variable = this.readVariable(context, expression.variableId);
       if (!variable) {
-        this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${expression.variableId} was not found.`, false);
+        this.attachMissingVariableError(context, expression.variableId);
         return undefined;
       }
       return variable.value;
@@ -1047,7 +1148,7 @@ class Runtime {
         const variableId = String(name).trim();
         const variable = this.readVariable(context, variableId);
         if (!variable) {
-          this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${variableId} was not found.`, false);
+          this.attachMissingVariableError(context, variableId);
           return "";
         }
         return String(variable.value ?? "");
@@ -1063,7 +1164,16 @@ class Runtime {
   private ensureVariable(flow: FlowVersion, variableId: string): RuntimeError | undefined {
     return (flow.definition.variables ?? []).some((variable: any) => variable.variableId === variableId)
       ? undefined
-      : this.runtimeError("VARIABLE_NOT_FOUND", `Variable ${variableId} was not found.`, false);
+      : this.missingVariableError(flow, variableId);
+  }
+
+  private attachMissingVariableError(context: TurnContext, variableId: string, explicitScope?: VariableScope): void {
+    this.attachRuntimeError(context, this.missingVariableError(context.flow, variableId, explicitScope));
+  }
+
+  private missingVariableError(flow: FlowVersion, variableId: string, explicitScope?: VariableScope): RuntimeError {
+    const scope = this.variableScope(flow, variableId, explicitScope);
+    return this.runtimeError("missing_variable_reference", `Variable ${variableId} was not found.`, false, { variableId, scope });
   }
 
   private variableScope(flow: FlowVersion, variableId: string, explicit?: VariableScope): VariableScope {
@@ -1192,10 +1302,22 @@ class Runtime {
     context.state.version += 1;
     context.state.lastOutboundMessages = context.messages;
     const trace = this.trace(context);
-    this.conversations.set(context.conversation.conversationId, clone(context.conversation));
-    this.states.set(context.state.conversationId, clone(context.state));
-    this.appendEvents(context.events);
-    this.appendTrace(trace);
+    await this.internalRepositories.conversations.save(context.conversation);
+    await this.internalRepositories.states.save(context.state as any);
+    await this.internalRepositories.events.append(context.events);
+    await this.internalRepositories.traces.save(trace);
+    if (this.repositories.conversations !== this.internalRepositories.conversations) {
+      await this.repositories.conversations.save(clone(context.conversation));
+    }
+    if (this.repositories.states !== this.internalRepositories.states) {
+      await this.repositories.states.save(clone(context.state) as any);
+    }
+    if (this.repositories.events !== this.internalRepositories.events) {
+      await this.repositories.events.append(clone(context.events));
+    }
+    if (this.repositories.traces !== this.internalRepositories.traces) {
+      await this.repositories.traces.save(clone(trace));
+    }
     return {
       conversation: clone(context.conversation),
       state: clone(context.state) as any,
@@ -1214,14 +1336,26 @@ class Runtime {
     return this.commit(context);
   }
 
-  private attachError(context: TurnContext, code: string, message: string, recoverable: boolean): void {
-    context.error = this.runtimeError(code, message, recoverable);
-    context.events.push(this.event(context, "error_raised", { code, message }));
-    context.fragments.push({ source: "error", data: { code, message, recoverable } });
+  private failWithError(context: TurnContext, error: RuntimeError): Promise<ProcessTurnResult> {
+    this.attachRuntimeError(context, error);
+    context.state.status = error.recoverable ? context.state.status : "failed";
+    if (!error.recoverable) context.conversation.status = "failed";
+    return this.commit(context);
   }
 
-  private runtimeError(code: string, message: string, recoverable: boolean): RuntimeError {
-    return { code, message, recoverable } as RuntimeError;
+  private attachError(context: TurnContext, code: string, message: string, recoverable: boolean, details: Record<string, unknown> = {}): void {
+    this.attachRuntimeError(context, this.runtimeError(code, message, recoverable, details));
+  }
+
+  private attachRuntimeError(context: TurnContext, error: RuntimeError): void {
+    const { code, message, recoverable, ...details } = error as RuntimeError & Record<string, unknown>;
+    context.error = error;
+    context.events.push(this.event(context, "error_raised", { code, message, ...details }));
+    context.fragments.push({ source: "error", data: { code, message, recoverable, ...details } });
+  }
+
+  private runtimeError(code: string, message: string, recoverable: boolean, details: Record<string, unknown> = {}): RuntimeError {
+    return { code, message, recoverable, ...details } as RuntimeError;
   }
 
   private event(context: TurnContext, type: string, payload: Record<string, unknown> = {}): ConversationEvent {
@@ -1278,7 +1412,7 @@ class Runtime {
   }
 
   private stepContext(context: TurnContext, step: StepDefinition) {
-    return { flow: context.flow, step, config: (step as any).config, state: context.state, turn: context.turn, services: {} };
+    return { flow: context.flow, step, config: (step as any).config, state: context.state, turn: context.turn, services: this.services() };
   }
 
   private inputContext(context: TurnContext, step: StepDefinition) {
@@ -1290,7 +1424,7 @@ class Runtime {
   }
 
   private operationContext(context: TurnContext, step: StepDefinition) {
-    return { flow: context.flow, step, state: context.state, turn: context.turn, services: {} };
+    return { flow: context.flow, step, state: context.state, turn: context.turn, services: this.services() };
   }
 
   private actionContext(context: TurnContext, step: StepDefinition) {
