@@ -1902,6 +1902,7 @@ export interface ConversationEngine {
     startConversation(request: StartConversationRequest): Promise<ProcessTurnResult>;
     processUserInput(request: ProcessUserInputRequest): Promise<ProcessTurnResult>;
     processExternalEvent(request: ProcessExternalEventRequest): Promise<ProcessTurnResult>;
+    subscribeToEvents(subscriber: ConversationEventSubscriber): ConversationEventSubscription;
 }
 
 export interface StartConversationRequest {
@@ -1931,6 +1932,113 @@ export interface ProcessTurnResult {
     messages: OutboundMessage[];
     trace: DecisionTrace;
     error?: RuntimeError;
+}
+
+export interface ConversationEventEnvelope {
+    event: ConversationEvent;
+    result: ProcessTurnResult;
+}
+
+export type ConversationEventSubscriber = (envelope: ConversationEventEnvelope) => void | Promise<void>;
+
+export interface ConversationEventSubscription {
+    unsubscribe(): void;
+}
+
+export interface ConversationApi {
+    readonly engine: ConversationEngine;
+    start(request: ConversationApiStartRequest): Promise<ConversationApiHttpResponse>;
+    sendMessage(request: ConversationApiTextRequest): Promise<ConversationApiHttpResponse>;
+    selectOption(request: ConversationApiChoiceRequest): Promise<ConversationApiHttpResponse>;
+    sendAttachments(request: ConversationApiAttachmentRequest): Promise<ConversationApiHttpResponse>;
+    sendEvent(request: ConversationApiEventRequest): Promise<ConversationApiHttpResponse>;
+    toHttpResponse(result: ProcessTurnResult): ConversationApiHttpResponse;
+    subscribeToEvents(subscriber: ConversationEventSubscriber): ConversationEventSubscription;
+}
+
+export type ConversationApiStartRequest = StartConversationRequest;
+
+export interface ConversationApiTextRequest {
+    conversationId: ConversationId;
+    text: string;
+    inputId?: MessageId;
+    turnId?: TurnId;
+    channel?: string;
+    receivedAt?: ISODateString;
+    metadata?: Metadata;
+}
+
+export interface ConversationApiChoiceRequest {
+    conversationId: ConversationId;
+    optionId?: OptionId;
+    label?: string;
+    payload?: JsonObject;
+    inputId?: MessageId;
+    turnId?: TurnId;
+    channel?: string;
+    receivedAt?: ISODateString;
+    metadata?: Metadata;
+}
+
+export interface ConversationApiAttachmentRequest {
+    conversationId: ConversationId;
+    attachments: AttachmentInput[];
+    inputId?: MessageId;
+    turnId?: TurnId;
+    channel?: string;
+    receivedAt?: ISODateString;
+    metadata?: Metadata;
+}
+
+export interface ConversationApiEventRequest {
+    conversationId: ConversationId;
+    eventType: string;
+    payload?: JsonObject;
+    inputId?: MessageId;
+    turnId?: TurnId;
+    channel?: string;
+    receivedAt?: ISODateString;
+    metadata?: Metadata;
+}
+
+export interface ConversationApiHttpResponse {
+    statusCode: number;
+    body: ConversationApiResponseBody;
+}
+
+export interface ConversationApiResponseBody {
+    ok: boolean;
+    conversationId: ConversationId;
+    turnId: TurnId;
+    status: ConversationStatus;
+    currentStepId: StepId;
+    messages: ConversationApiMessage[];
+    choices: ConversationApiChoice[];
+    variables: Record<VariableId, ConversationApiVariable>;
+    events: ConversationEvent[];
+    trace: DecisionTrace;
+    error?: RuntimeError;
+}
+
+export interface ConversationApiMessage {
+    messageId: MessageId;
+    type: OutboundMessageContent["type"];
+    text?: string;
+    payload?: JsonObject;
+}
+
+export interface ConversationApiChoice {
+    optionId: OptionId;
+    label: string;
+    payload?: JsonObject;
+}
+
+export interface ConversationApiVariable {
+    value: unknown;
+    scope?: VariableScope;
+    source?: VariableValueSource;
+    updatedAt?: ISODateString;
+    metadata?: Metadata;
 }
 
 /* ============================================================
@@ -1995,6 +2103,7 @@ export interface CreateConversationEngineOptions {
     normalizers?: Record<string, Normalizer | Normalizer["normalize"]>;
     extractors?: Record<string, Extractor | Extractor["extract"]>;
     resolvers?: Resolver[];
+    eventSubscribers?: readonly ConversationEventSubscriber[];
     actionHandlers?: Record<ActionKind, ActionHandler | ActionExecutor["execute"]>;
     customOperations?: Record<string, {
         inputSchema?: JsonObject;

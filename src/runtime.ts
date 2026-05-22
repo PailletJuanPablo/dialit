@@ -10,6 +10,9 @@ import type {
   ConversationEngineRepositories,
   ConversationEvent,
   ConversationEventType,
+  ConversationEventEnvelope,
+  ConversationEventSubscriber,
+  ConversationEventSubscription,
   ConversationEngineConfig,
   ConversationState,
   CustomOperation,
@@ -122,10 +125,12 @@ class Runtime {
   private readonly clock: RuntimeClock;
   private readonly idGenerator: IdGenerator;
   private readonly maxStepExecutionsPerTurn: number;
+  private readonly eventSubscribers = new Set<ConversationEventSubscriber>();
   private serviceModule?: RuntimeServices;
 
   constructor(private readonly options: EngineOptions) {
     for (const flowVersion of options.flowVersions ?? []) this.flowVersions.set(flowVersion.flowVersionId, flowVersion);
+    for (const subscriber of options.eventSubscribers ?? []) this.eventSubscribers.add(subscriber);
     this.clock = options.runtime?.clock ?? options.clock ?? { now: () => new Date().toISOString() };
     let counter = 0;
     const next = (prefix: string) => `${prefix}-${++counter}`;
@@ -177,9 +182,19 @@ class Runtime {
       startConversation: (request) => this.startConversation(request),
       processUserInput: (request) => this.processUserInput(request),
       processExternalEvent: (request) => this.processUserInput({ conversationId: request.conversationId, input: request.event }),
+      subscribeToEvents: (subscriber) => this.subscribeToEvents(subscriber),
       repositories: this.repositories,
       services: this.services(),
       runtime: this.runtimeContext,
+    };
+  }
+
+  private subscribeToEvents(subscriber: ConversationEventSubscriber): ConversationEventSubscription {
+    this.eventSubscribers.add(subscriber);
+    return {
+      unsubscribe: () => {
+        this.eventSubscribers.delete(subscriber);
+      },
     };
   }
 
@@ -2083,7 +2098,7 @@ class Runtime {
     await this.repositories.states.save(clone(context.state));
     await this.repositories.events.append(clone(context.events));
     await this.repositories.traces.save(clone(trace));
-    return {
+    const result = {
       conversation: clone(context.conversation),
       state: clone(context.state),
       turn: clone(context.turn),
@@ -2092,6 +2107,22 @@ class Runtime {
       trace: clone(trace),
       ...(context.error ? { error: context.error } : {}),
     };
+    await this.publishEvents(result);
+    return result;
+  }
+
+  private async publishEvents(result: ProcessTurnResult): Promise<void> {
+    if (this.eventSubscribers.size === 0 || result.events.length === 0) return;
+    const subscribers = [...this.eventSubscribers];
+    for (const event of result.events) {
+      const envelope: ConversationEventEnvelope = {
+        event: clone(event),
+        result: clone(result),
+      };
+      for (const subscriber of subscribers) {
+        await subscriber(envelope);
+      }
+    }
   }
 
   private fail(context: TurnContext, code: OperationalRuntimeErrorCode, message: string, recoverable: boolean): Promise<ProcessTurnResult> {
