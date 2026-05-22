@@ -1915,9 +1915,23 @@ export interface CreateConversationEngineOptions {
     repositories?: Partial<ConversationEngineRepositories>;
     services?: Partial<RuntimeServices>;
     runtime?: Partial<RuntimeContext>;
+    flowVersions?: FlowVersion[];
+    clock?: RuntimeClock;
+    idGenerator?: Partial<IdGenerator>;
+    maxStepExecutionsPerTurn?: number;
+    stepHandlers?: Record<string, StepHandler>;
+    actionHandlers?: Record<ActionKind, ActionHandler | ActionExecutor["execute"]>;
+    customOperations?: Record<string, {
+        inputSchema?: JsonObject;
+        outputVariables?: VariableId[];
+        outcomes: StepOutcome[];
+        execute(operation: CustomOperation, input: Record<string, unknown>, context: OperationExecutionContext): Promise<CustomOperationResult | OperationResult>;
+    }>;
+    semanticInputResolver?: SemanticInputResolver | SemanticInputResolver["resolve"];
+    llmResponseGenerator?: LlmResponseGenerator | LlmResponseGenerator["generate"];
 }
 
-export type CreateConversationEngine = (options?: CreateConversationEngineOptions) => ConversationEngine;
+export type CreateConversationEngine = (options?: CreateConversationEngineOptions) => ConversationEngine & ConversationEngineModule;
 
 export interface RuntimeContext {
     config: ConversationEngineConfig;

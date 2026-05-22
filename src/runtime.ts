@@ -5,12 +5,14 @@ import type {
   ConversationEngine,
   ConversationEngineModule,
   ConversationEvent,
+  CreateConversationEngineOptions,
   ConversationState,
   DecisionTrace,
   FlowVersion,
   OutboundMessage,
   ProcessTurnResult,
   RuntimeError,
+  RuntimeServices,
   StepBranch,
   StepDefinition,
   StepOperation,
@@ -22,7 +24,7 @@ import type {
   VariableValueSource,
 } from "./types.js";
 
-type EngineOptions = {
+type EngineOptions = CreateConversationEngineOptions & {
   flowVersions?: FlowVersion[];
   clock?: { now(): string };
   idGenerator?: Partial<Record<string, () => string>>;
@@ -36,6 +38,7 @@ type EngineOptions = {
 
 type InternalState = Omit<ConversationState, "variables" | "variableHistory"> & {
   variables: Record<string, { variableId: string; scope?: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> }>;
+  scopedVariables: Record<string, { variableId: string; scope: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> }>;
   variableHistory: Record<string, Array<Record<string, unknown>>>;
   __flowScopes?: Record<string, VariableScope>;
 };
@@ -68,6 +71,7 @@ type StepRunResult = {
   error?: RuntimeError;
 };
 
+const builtInStepTypes = new Set(["message", "menu", "input", "attachment", "condition", "end", "custom"]);
 const builtInOperationTypes = new Set([
   "send_message",
   "set_variable",
@@ -150,8 +154,69 @@ class Runtime {
           listByConversationId: async (conversationId) => clone(this.traces.get(conversationId) ?? []),
         },
       },
-      services: {} as any,
+      services: this.services(),
       runtime: { config: {}, clock: this.clock, idGenerator: this.idGenerator as any },
+    };
+  }
+
+  private services(): RuntimeServices {
+    return {
+      stepRegistry: {
+        register: (handler: any) => {
+          this.options.stepHandlers = { ...(this.options.stepHandlers ?? {}), [handler.stepType]: handler };
+        },
+        getHandler: (stepType: string) => {
+          const handler = this.options.stepHandlers?.[stepType];
+          if (!handler) throw this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${stepType} is not registered.`, false);
+          return handler as any;
+        },
+        hasHandler: (stepType: string) => builtInStepTypes.has(stepType) || Boolean(this.options.stepHandlers?.[stepType]),
+      },
+      operationExecutor: {
+        executeMany: async () => {
+          throw this.runtimeError("OPERATION_EXECUTION_CONTEXT_REQUIRED", "Use ConversationEngine to execute operations with a full turn context.", false);
+        },
+      },
+      inputProcessor: {
+        process: async () => {
+          throw this.runtimeError("INPUT_PROCESSING_CONTEXT_REQUIRED", "Use ConversationEngine to process input with a full turn context.", false);
+        },
+      },
+      responseRenderer: {
+        render: async () => {
+          throw this.runtimeError("RESPONSE_RENDERING_CONTEXT_REQUIRED", "Use ConversationEngine to render responses with a full turn context.", false);
+        },
+      },
+      actionExecutor: {
+        execute: async (action: ActionDefinition, input: Record<string, unknown>, context: unknown) => {
+          const handler = this.options.actionHandlers?.[action.kind];
+          if (!handler) throw this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false);
+          return typeof handler === "function" ? handler(action, input, context as any) as any : handler.execute(action, input, context as any) as any;
+        },
+      },
+      conditionEvaluator: {
+        evaluate: async (condition: any, context: any) => ({ matched: this.evaluateCondition({ ...context, fragments: [] } as TurnContext, condition) }),
+      },
+      transitionResolver: {
+        resolveFromStepResult: async (step: StepDefinition, result: any) => result.branch ?? (result.outcome ? this.resolveRoute(step, result.outcome) : undefined),
+        resolveFromOutcome: async (step: StepDefinition, outcome: string) => this.resolveRoute(step, outcome),
+      },
+      stateReducer: {
+        apply: (state: ConversationState) => state,
+      },
+      traceBuilder: {
+        build: (input: any) => ({
+          traceId: this.newId("newTraceId", "trace"),
+          createdAt: this.clock.now(),
+          ...input,
+        }),
+      },
+      semanticInputResolver: typeof this.options.semanticInputResolver === "function"
+        ? { resolve: this.options.semanticInputResolver as any }
+        : this.options.semanticInputResolver,
+      llmResponseGenerator: typeof this.options.llmResponseGenerator === "function"
+        ? { generate: this.options.llmResponseGenerator as any }
+        : this.options.llmResponseGenerator,
     };
   }
 
@@ -167,6 +232,7 @@ class Runtime {
     }
 
     context.events.push(this.event(context, "conversation_started", { flowVersionId: flow.flowVersionId }));
+    this.applyInitialVariables(context, request.initialVariables ?? {});
     await this.runAutomaticSteps(context);
     return this.commit(context);
   }
@@ -379,24 +445,25 @@ class Runtime {
 
   private async handleMenuInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
     const options = ((step as any).config.options ?? []) as Array<Record<string, any>>;
+    const selection = (step as any).config.selection ?? {};
     let selected: Record<string, any> | undefined;
     let resolver = "unknown";
-    if ((input as any).type === "choice" && (input as any).optionId) {
+    if (selection.allowButtons !== false && (input as any).type === "choice" && (input as any).optionId) {
       selected = options.find((option) => option.optionId === (input as any).optionId);
       resolver = "option_id";
     }
     if (!selected && (input as any).type === "text") {
       const text = String((input as any).text ?? "").trim();
       const number = Number(text);
-      if (Number.isInteger(number) && number >= 1 && number <= options.length) {
+      if (selection.allowNumbers !== false && Number.isInteger(number) && number >= 1 && number <= options.length) {
         selected = options[number - 1];
         resolver = "number";
       }
-      if (!selected) {
+      if (!selected && selection.allowExactText !== false) {
         selected = options.find((option) => String(option.label ?? "").toLowerCase() === text.toLowerCase());
         resolver = "exact_text";
       }
-      if (!selected) {
+      if (!selected && selection.allowAliases !== false) {
         selected = options.find((option) => (option.aliases ?? []).some((alias: string) => alias.toLowerCase() === text.toLowerCase()));
         resolver = "alias";
       }
@@ -421,7 +488,9 @@ class Runtime {
     const raw = String((input as any).text ?? "");
     const value = raw.trim();
     for (const validator of binding?.validators ?? []) {
-      if (!this.validateValue(value, validator)) return this.invalidInput(context, step, validator.message ?? "Input is invalid.");
+      const validation = this.validateValue(value, validator);
+      if (validation.error) return { status: "failed", error: validation.error };
+      if (!validation.valid) return this.invalidInput(context, step, validator.message ?? "Input is invalid.");
     }
     const patches: VariablePatch[] = [{ type: "set", variableId: binding.targetVariableId, value, source: "user_input" } as any];
     const fragments: Array<Record<string, unknown>> = [{ source: "input:resolve", data: { status: "resolved", variableId: binding.targetVariableId } }];
@@ -492,6 +561,8 @@ class Runtime {
   }
 
   private async invalidInput(context: TurnContext, step: StepDefinition, reason: unknown): Promise<StepRunResult> {
+    const semantic = await this.resolveSemanticAfterInvalidInput(context, step);
+    if (semantic) return semantic;
     const rendered = await this.renderInvalid(context, step, (step as any).config.input?.invalidBehavior);
     return {
       status: "waiting_input",
@@ -522,12 +593,46 @@ class Runtime {
     return { messages, events, fragments };
   }
 
-  private validateValue(value: string, validator: any): boolean {
-    if (validator.type === "regex") return new RegExp(String(validator.options?.pattern ?? "")).test(value);
-    if (validator.type === "integer") return /^-?\d+$/.test(value);
-    if (validator.type === "number") return !Number.isNaN(Number(value));
-    if (validator.type === "required") return value.length > 0;
-    return true;
+  private async resolveSemanticAfterInvalidInput(context: TurnContext, step: StepDefinition): Promise<StepRunResult | undefined> {
+    const tasks = ((step as any).config.input?.semanticTasks ?? []).filter((task: any) => task.mode === "after_invalid_input");
+    if (tasks.length === 0) return undefined;
+    const resolver = this.options.semanticInputResolver;
+    if (!resolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
+    const task = tasks[0];
+    context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
+    const semantic = await this.callSemanticResolver(resolver, context.turn.userInput as UserInput, task, this.inputContext(context, step));
+    const outcome = (semantic as any).outcome;
+    const variables = (semantic as any).variables ?? {};
+    if (!task.allowedOutcomes.includes(outcome)) {
+      return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic outcome ${outcome} is not declared.`, false) };
+    }
+    const patches: VariablePatch[] = [];
+    for (const variableId of Object.keys(variables)) {
+      if (task.allowedVariableIds && !task.allowedVariableIds.includes(variableId)) {
+        return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic variable ${variableId} is not declared.`, false) };
+      }
+      patches.push({ type: "set", variableId, value: variables[variableId], source: "semantic_input_task" } as any);
+    }
+    context.events.push(this.event(context, "semantic_input_task_completed", { taskId: task.taskId, outcome }));
+    context.llmUsage.push({ purpose: "input_resolution", success: true });
+    return {
+      status: "completed",
+      outcome,
+      patches,
+      fragments: [{ source: "semantic_input", data: { taskId: task.taskId, outcome, variables } }],
+    };
+  }
+
+  private validateValue(value: string, validator: any): { valid: boolean; error?: RuntimeError } {
+    if (validator.type === "regex") return { valid: new RegExp(String(validator.options?.pattern ?? "")).test(value) };
+    if (validator.type === "integer") return { valid: /^-?\d+$/.test(value) };
+    if (validator.type === "number") return { valid: !Number.isNaN(Number(value)) };
+    if (validator.type === "required") return { valid: value.length > 0 };
+    if (validator.type === "email") return { valid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) };
+    if (validator.type === "min_length") return { valid: value.length >= Number(validator.options?.min ?? validator.options?.value ?? 0) };
+    if (validator.type === "max_length") return { valid: value.length <= Number(validator.options?.max ?? validator.options?.value ?? Number.MAX_SAFE_INTEGER) };
+    if (validator.type === "enum") return { valid: (validator.options?.values ?? []).includes(value) };
+    return { valid: false, error: this.runtimeError("VALIDATOR_NOT_REGISTERED", `Validator ${validator.type} is not registered.`, false) };
   }
 
   private async executeBranch(context: TurnContext, step: StepDefinition, branch: StepBranch): Promise<StepRunResult> {
@@ -570,6 +675,7 @@ class Runtime {
       const error = this.ensureVariable(context.flow, operation.variableId);
       if (error) return { status: "failed", error };
       const value = this.resolveValue(context, operation.value);
+      if (context.error) return { status: "failed", error: context.error };
       return {
         status: "completed",
         patches: [{ type: "set", variableId: operation.variableId, value, source: operation.source ?? "operation", metadata: { operationId: operation.operationId }, scope: operation.scope } as any],
@@ -603,7 +709,7 @@ class Runtime {
     if (!handler) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
     context.events.push(this.event(context, "action_started", { actionId: action.actionId, actionKind: action.kind }));
-    const result = await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step)) : handler.execute(action, input, this.actionContext(context, step))) as any;
+    const result = await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step) as any) : handler.execute(action, input, this.actionContext(context, step) as any)) as any;
     const outcome = result.outcome ?? result.status;
     if (action.resultOutcomes && outcome && !action.resultOutcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("ACTION_RESULT_OUT_OF_CONTRACT", `Action outcome ${outcome} is not declared.`, false) };
@@ -660,9 +766,18 @@ class Runtime {
     const childContext: TurnContext = { ...context, flow: childFlow, nested: true, initialStepId: childFlow.definition.startStepId };
     childContext.state.currentStepId = childFlow.definition.startStepId;
     childContext.state.status = "active";
+    const parentScopedSnapshot = new Map<string, any>();
+    for (const variableId of isolatedVariables) {
+      parentScopedSnapshot.set(variableId, clone(context.state.scopedVariables[this.scopedKey("conversation", variableId)]));
+    }
     context.events.push(this.event(context, "flow_call_started", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId }));
     await this.runAutomaticSteps(childContext);
-    for (const variableId of isolatedVariables) delete context.state.variables[variableId];
+    for (const variableId of isolatedVariables) {
+      this.deleteScopedVariable(context.state, variableId, "flow");
+      const parentValue = parentScopedSnapshot.get(variableId);
+      if (parentValue) this.writeScopedVariable(context.state, variableId, "conversation", parentValue);
+      else if (this.variableScope(context.flow, variableId) !== "conversation") delete context.state.variables[variableId];
+    }
     context.state.status = "active";
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: "completed" }));
     const result = { status: "completed", outcome: "completed" };
@@ -767,10 +882,11 @@ class Runtime {
   private applyPatch(context: TurnContext, patch: VariablePatch): void {
     const variableId = (patch as any).variableId;
     const scope = this.variableScope(context.flow, variableId, (patch as any).scope);
-    const previous = context.state.variables[variableId]?.value;
+    const previousVariable = this.readScopedVariable(context.state, variableId, scope);
+    const previous = previousVariable?.value;
     const operationId = (patch as any).metadata?.operationId;
     if ((patch as any).type === "set") {
-      context.state.variables[variableId] = {
+      const nextVariable = {
         variableId,
         scope,
         value: (patch as any).value,
@@ -778,21 +894,23 @@ class Runtime {
         updatedAt: this.clock.now(),
         metadata: (patch as any).metadata,
       };
+      this.writeScopedVariable(context.state, variableId, scope, nextVariable);
       context.events.push(this.event(context, "variable_set", { variableId, scope }));
     }
     if ((patch as any).type === "unset") {
-      delete context.state.variables[variableId];
+      this.deleteScopedVariable(context.state, variableId, scope);
       context.events.push(this.event(context, "variable_unset", { variableId, scope }));
     }
     if ((patch as any).type === "invalidate") {
-      context.state.variables[variableId] = {
+      const nextVariable = {
         variableId,
         scope,
-        value: context.state.variables[variableId]?.value,
+        value: previousVariable?.value,
         source: (patch as any).source,
         updatedAt: this.clock.now(),
         metadata: { ...((patch as any).metadata ?? {}), invalidated: true },
       };
+      this.writeScopedVariable(context.state, variableId, scope, nextVariable);
       context.events.push(this.event(context, "variable_invalidated", { variableId, scope }));
     }
     context.patches.push(patch);
@@ -844,7 +962,7 @@ class Runtime {
       context.events.push(this.event(context, "llm_response_generation_started", { stepId: step.stepId }));
       try {
         const filteredContext = { ...this.responseContext(context, step), state: this.filterStateForGeneratedResponse(context.state, plan.allowedVariableIds ?? []) };
-        const generated = await (typeof generator === "function" ? generator(plan, filteredContext) : generator.generate(plan, filteredContext));
+        const generated = await (typeof generator === "function" ? generator(plan, filteredContext as any) : generator.generate(plan, filteredContext as any));
         const text = typeof generated === "string" ? generated : (generated as any).text;
         context.events.push(this.event(context, "llm_response_generation_completed", { stepId: step.stepId }));
         context.llmUsage.push({ purpose: "response_generation", success: true });
@@ -861,9 +979,14 @@ class Runtime {
     if (plan?.mode === "template") {
       text = String(plan.template ?? "").replace(/\{\{([^}]+)\}\}/g, (_match, name) => {
         const variableId = String(name).trim();
-        context.fragments.push({ source: "variable:read", data: { variableId, scope: this.variableScope(context.flow, variableId), found: variableId in context.state.variables } });
-        return String(context.state.variables[variableId]?.value ?? "");
+        const variable = this.readVariable(context, variableId);
+        if (!variable) {
+          this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${variableId} was not found.`, false);
+          return "";
+        }
+        return String(variable.value ?? "");
       });
+      if (context.error) return emptyRendered();
     } else {
       text = String(plan?.text ?? "");
     }
@@ -878,6 +1001,7 @@ class Runtime {
   private filterStateForGeneratedResponse(state: InternalState, allowedVariableIds: string[]): InternalState {
     const filtered = clone(state);
     filtered.variables = Object.fromEntries(Object.entries(state.variables).filter(([variableId]) => allowedVariableIds.includes(variableId)));
+    filtered.scopedVariables = Object.fromEntries(Object.entries(state.scopedVariables).filter(([, variable]) => allowedVariableIds.includes(variable.variableId)));
     return filtered;
   }
 
@@ -911,11 +1035,23 @@ class Runtime {
     if (!expression || typeof expression !== "object") return expression;
     if (expression.type === "literal") return expression.value;
     if (expression.type === "variable") {
-      context.fragments.push({ source: "variable:read", data: { variableId: expression.variableId, scope: this.variableScope(context.flow, expression.variableId), found: expression.variableId in context.state.variables } });
-      return context.state.variables[expression.variableId]?.value;
+      const variable = this.readVariable(context, expression.variableId);
+      if (!variable) {
+        this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${expression.variableId} was not found.`, false);
+        return undefined;
+      }
+      return variable.value;
     }
     if (expression.type === "template") {
-      return String(expression.template ?? "").replace(/\{\{([^}]+)\}\}/g, (_match, name) => String(context.state.variables[String(name).trim()]?.value ?? ""));
+      return String(expression.template ?? "").replace(/\{\{([^}]+)\}\}/g, (_match, name) => {
+        const variableId = String(name).trim();
+        const variable = this.readVariable(context, variableId);
+        if (!variable) {
+          this.attachError(context, "VARIABLE_NOT_FOUND", `Variable ${variableId} was not found.`, false);
+          return "";
+        }
+        return String(variable.value ?? "");
+      });
     }
     return undefined;
   }
@@ -932,6 +1068,43 @@ class Runtime {
 
   private variableScope(flow: FlowVersion, variableId: string, explicit?: VariableScope): VariableScope {
     return explicit ?? ((flow.definition.variables ?? []).find((variable: any) => variable.variableId === variableId)?.scope ?? "conversation");
+  }
+
+  private scopedKey(scope: VariableScope, variableId: string): string {
+    return `${scope}:${variableId}`;
+  }
+
+  private readScopedVariable(state: InternalState, variableId: string, scope: VariableScope) {
+    return state.scopedVariables[this.scopedKey(scope, variableId)];
+  }
+
+  private writeScopedVariable(
+    state: InternalState,
+    variableId: string,
+    scope: VariableScope,
+    value: { variableId: string; scope?: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> },
+  ): void {
+    const scopedValue = { ...value, scope };
+    state.scopedVariables[this.scopedKey(scope, variableId)] = scopedValue;
+    if (scope === "conversation" || !(variableId in state.variables)) {
+      state.variables[variableId] = scopedValue;
+    }
+  }
+
+  private deleteScopedVariable(state: InternalState, variableId: string, scope: VariableScope): void {
+    delete state.scopedVariables[this.scopedKey(scope, variableId)];
+    if (state.variables[variableId]?.scope === scope) {
+      const conversationValue = state.scopedVariables[this.scopedKey("conversation", variableId)];
+      if (conversationValue) state.variables[variableId] = conversationValue;
+      else delete state.variables[variableId];
+    }
+  }
+
+  private readVariable(context: TurnContext, variableId: string, explicitScope?: VariableScope) {
+    const scope = this.variableScope(context.flow, variableId, explicitScope);
+    const variable = this.readScopedVariable(context.state, variableId, scope);
+    context.fragments.push({ source: "variable:read", data: { variableId, scope, found: Boolean(variable) } });
+    return variable;
   }
 
   private getStep(flow: FlowVersion, stepId: string): StepDefinition | undefined {
@@ -958,27 +1131,31 @@ class Runtime {
       status: flow ? "active" : "failed",
       currentStepId: flow?.definition.startStepId ?? "unknown",
       variables: {},
+      scopedVariables: {},
       variableHistory: {},
       executionStack: [],
       version: 0,
       updatedAt: this.clock.now(),
     } as InternalState;
-    for (const variable of flow?.definition.variables ?? []) {
+    return state;
+  }
+
+  private applyInitialVariables(context: TurnContext, initialVariables: Record<string, unknown>): void {
+    for (const variable of context.flow.definition.variables ?? []) {
       const typed = variable as any;
-      if ("defaultValue" in typed) this.applyPatch({ flow, conversation, state, turn: this.createTurn(conversation.conversationId), messages: [], events: [], fragments: [], patches: [], llmUsage: [] } as TurnContext, { type: "set", variableId: typed.variableId, value: typed.defaultValue, source: "system", scope: typed.scope } as any);
+      if ("defaultValue" in typed) this.applyPatch(context, { type: "set", variableId: typed.variableId, value: typed.defaultValue, source: "system", scope: typed.scope } as any);
     }
     for (const [variableId, value] of Object.entries(initialVariables)) {
       if (value && typeof value === "object" && !Array.isArray(value) && ["conversation", "flow", "operation", "system"].some((scope) => scope in (value as any))) {
         for (const [scope, scopedValues] of Object.entries(value as Record<string, Record<string, unknown>>)) {
           for (const [scopedVariableId, scopedValue] of Object.entries(scopedValues)) {
-            this.applyPatch({ flow, conversation, state, turn: this.createTurn(conversation.conversationId), messages: [], events: [], fragments: [], patches: [], llmUsage: [] } as TurnContext, { type: "set", variableId: scopedVariableId, value: scopedValue, source: "system", scope } as any);
+            this.applyPatch(context, { type: "set", variableId: scopedVariableId, value: scopedValue, source: "system", scope } as any);
           }
         }
       } else {
-        this.applyPatch({ flow, conversation, state, turn: this.createTurn(conversation.conversationId), messages: [], events: [], fragments: [], patches: [], llmUsage: [] } as TurnContext, { type: "set", variableId, value, source: "system" } as any);
+        this.applyPatch(context, { type: "set", variableId, value, source: "system" } as any);
       }
     }
-    return state;
   }
 
   private createTurn(conversationId: string, userInput?: UserInput): Turn {
@@ -1121,7 +1298,7 @@ class Runtime {
   }
 
   private async callSemanticResolver(resolver: NonNullable<EngineOptions["semanticInputResolver"]>, input: UserInput, task: unknown, context: unknown): Promise<unknown> {
-    return typeof resolver === "function" ? resolver(input, task, context) : resolver.resolve(input, task, context);
+    return typeof resolver === "function" ? resolver(input, task as any, context as any) : resolver.resolve(input, task as any, context as any);
   }
 
   private normalizeExternalStepResult(result: any): StepRunResult {

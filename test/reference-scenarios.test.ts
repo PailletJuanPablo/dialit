@@ -615,6 +615,123 @@ describe("Nexembot v0.1 model validation", () => {
   });
 });
 
+describe("Nexembot v0.1 spec regression coverage", () => {
+  it("isolates flow scoped variables with the same name as parent conversation variables", async () => {
+    const runtime = engineWith(scopeCollisionParentFlow(), {
+      flowVersions: [scopeCollisionChildFlow()],
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-scope-collision",
+      flowVersionId: "scope-collision-parent-v1",
+      initialVariables: { sharedName: "parent-value" },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "sharedName")).toBe("parent-value");
+    expect(texts(result)).toContain("Parent still has parent-value.");
+  });
+
+  it("records initial variables as events, trace patches, and variable history", async () => {
+    const runtime = engineWith(initialVariableTraceFlow());
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-initial-trace",
+      flowVersionId: "initial-trace-v1",
+      initialVariables: { contactReason: "billing" },
+    });
+
+    expect(eventTypes(result)).toContain("variable_set");
+    expect(result.trace.variablePatches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "set", variableId: "contactReason", source: "system" }),
+      ]),
+    );
+    expect(variableHistory(result, "contactReason")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ nextValue: "billing", source: "system" }),
+      ]),
+    );
+  });
+
+  it("runs after_invalid_input semantic tasks before retrying", async () => {
+    const semanticInputResolver = vi.fn(async () => ({
+      outcome: "request_handoff",
+      confidence: 0.95,
+      variables: { contactReason: "agent" },
+    }));
+    const runtime = engineWith(afterInvalidSemanticFlow(), { semanticInputResolver });
+    await runtime.startConversation({
+      conversationId: "conversation-after-invalid",
+      flowVersionId: "after-invalid-semantic-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-after-invalid",
+      input: textInput("conversation-after-invalid", "I want a human"),
+    });
+
+    expect(semanticInputResolver).toHaveBeenCalled();
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "contactReason")).toBe("agent");
+    expect(result.state.currentStepId).toBe("handoff_message");
+    expect(texts(result)).toContain("Routing to a human.");
+  });
+
+  it("honors menu selection policies and rejects disabled number selection", async () => {
+    const runtime = engineWith(menuPolicyFlow());
+    await runtime.startConversation({
+      conversationId: "conversation-menu-policy",
+      flowVersionId: "menu-policy-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-menu-policy",
+      input: textInput("conversation-menu-policy", "1"),
+    });
+
+    expect(result.state.currentStepId).toBe("policy_menu");
+    expect(texts(result)).toEqual([
+      "Please choose by label.",
+      "Policy menu.",
+    ]);
+    expect(variableValue(result, "contactReason")).toBeUndefined();
+  });
+
+  it("fails loudly when a template references a missing variable", async () => {
+    const result = await engineWith(missingTemplateVariableFlow()).startConversation({
+      conversationId: "conversation-missing-template-variable",
+      flowVersionId: "missing-template-variable-v1",
+    });
+
+    expectStructuredFailure(result, "VARIABLE_NOT_FOUND");
+  });
+
+  it("fails loudly when an operation value references a missing variable", async () => {
+    const result = await engineWith(missingExpressionVariableFlow()).startConversation({
+      conversationId: "conversation-missing-expression-variable",
+      flowVersionId: "missing-expression-variable-v1",
+    });
+
+    expectStructuredFailure(result, "VARIABLE_NOT_FOUND");
+  });
+
+  it("fails loudly for unknown validators instead of accepting invalid input", async () => {
+    const runtime = engineWith(unknownValidatorFlow());
+    await runtime.startConversation({
+      conversationId: "conversation-unknown-validator",
+      flowVersionId: "unknown-validator-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-unknown-validator",
+      input: textInput("conversation-unknown-validator", "anything"),
+    });
+
+    expectStructuredFailure(result, "VALIDATOR_NOT_REGISTERED");
+  });
+});
+
 function engineWith(primaryFlowVersion: FlowVersion, options: Record<string, unknown> = {}) {
   const extraFlowVersions = Array.isArray(options.flowVersions) ? options.flowVersions : [];
 
@@ -1183,6 +1300,165 @@ function routeConditionFlow(): FlowVersion {
             condition: equals(variableRef("contactReason"), literal("billing")),
           },
         ],
+      }),
+    ],
+  });
+}
+
+function scopeCollisionParentFlow(): FlowVersion {
+  return flowVersion("scope-collision-parent-v1", {
+    flowId: "scope-collision-parent",
+    startStepId: "call_child",
+    variables: [variable("sharedName", "string", "conversation")],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "call_flow",
+            operationId: "call_scope_child",
+            flowVersionId: "scope-collision-child-v1",
+            sharedVariableIds: ["sharedName"],
+            onResult: [
+              {
+                match: { type: "outcome", outcome: "completed" },
+                branch: branch({ target: stepTarget("done") }),
+              },
+            ],
+          },
+        ],
+      }),
+      messageStep("done", [{ mode: "template", template: "Parent still has {{sharedName}}.", variableIds: ["sharedName"] }]),
+    ],
+  });
+}
+
+function scopeCollisionChildFlow(): FlowVersion {
+  return flowVersion("scope-collision-child-v1", {
+    flowId: "scope-collision-child",
+    startStepId: "set_local",
+    variables: [variable("sharedName", "string", "flow")],
+    steps: [
+      messageStep("set_local", [], {
+        autoAdvance: true,
+        onEnter: [setVariable("sharedName", "child-local", "operation")],
+        routes: [route("next", branch({ target: endTarget("completed") }))],
+      }),
+    ],
+  });
+}
+
+function initialVariableTraceFlow(): FlowVersion {
+  return flowVersion("initial-trace-v1", {
+    flowId: "initial-trace",
+    startStepId: "done",
+    variables: [variable("contactReason", "string", "conversation")],
+    steps: [messageStep("done", ["Done."])],
+  });
+}
+
+function afterInvalidSemanticFlow(): FlowVersion {
+  return flowVersion("after-invalid-semantic-v1", {
+    flowId: "after-invalid-semantic",
+    startStepId: "ask_dni",
+    variables: [
+      variable("dni", "string", "conversation"),
+      variable("contactReason", "string", "conversation"),
+    ],
+    steps: [
+      inputStep("ask_dni", "Please enter DNI.", "dni", {
+        validators: [{ type: "regex", options: { pattern: "^\\d+$" } }],
+        invalidMessage: "DNI must contain only numbers.",
+        semanticTasks: [
+          {
+            taskId: "invalid_to_handoff",
+            mode: "after_invalid_input",
+            allowedOutcomes: ["request_handoff"],
+            allowedVariableIds: ["contactReason"],
+            threshold: 0.8,
+          },
+        ],
+        routes: [
+          route("captured", branch({ target: endTarget("completed") })),
+          route("request_handoff", branch({ target: stepTarget("handoff_message") })),
+        ],
+      }),
+      messageStep("handoff_message", ["Routing to a human."]),
+    ],
+  });
+}
+
+function menuPolicyFlow(): FlowVersion {
+  return flowVersion("menu-policy-v1", {
+    flowId: "menu-policy",
+    startStepId: "policy_menu",
+    variables: [variable("contactReason", "string", "conversation")],
+    steps: [
+      {
+        stepId: "policy_menu",
+        type: "menu",
+        config: {
+          prompt: staticText("Policy menu."),
+          options: [
+            option("billing", "Billing", ["billing"], branch({
+              operations: [setVariable("contactReason", "billing", "menu_selection")],
+              target: endTarget("completed"),
+            })),
+          ],
+          selection: {
+            allowNumbers: false,
+            allowExactText: true,
+            allowAliases: true,
+            allowButtons: true,
+          },
+          invalidSelection: {
+            message: staticText("Please choose by label."),
+            target: { type: "stay" },
+          },
+        },
+      },
+    ],
+  });
+}
+
+function missingTemplateVariableFlow(): FlowVersion {
+  return flowVersion("missing-template-variable-v1", {
+    flowId: "missing-template-variable",
+    startStepId: "message",
+    variables: [],
+    steps: [messageStep("message", [{ mode: "template", template: "Hello {{missingName}}.", variableIds: ["missingName"] }])],
+  });
+}
+
+function missingExpressionVariableFlow(): FlowVersion {
+  return flowVersion("missing-expression-variable-v1", {
+    flowId: "missing-expression-variable",
+    startStepId: "start",
+    variables: [variable("target", "string", "conversation")],
+    steps: [
+      messageStep("start", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "set_variable",
+            variableId: "target",
+            value: variableRef("missingSource"),
+          },
+        ],
+      }),
+    ],
+  });
+}
+
+function unknownValidatorFlow(): FlowVersion {
+  return flowVersion("unknown-validator-v1", {
+    flowId: "unknown-validator",
+    startStepId: "ask",
+    variables: [variable("dni", "string", "conversation")],
+    steps: [
+      inputStep("ask", "Value?", "dni", {
+        validators: [{ type: "not_registered_validator" }],
+        routes: [route("captured", branch({ target: endTarget("completed") }))],
       }),
     ],
   });
