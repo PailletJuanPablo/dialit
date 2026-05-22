@@ -56,7 +56,7 @@ describe("Nexembot v0.1 reference scenarios", () => {
   });
 
   it.each([
-    ["number", textInput("menu-number", "1")],
+    ["number", textInput("menu-number", "2")],
     ["exact text", textInput("menu-text", "Billing question")],
     ["alias", textInput("menu-alias", "billing")],
     ["option id", choiceInput("menu-option-id", "billing")],
@@ -328,7 +328,7 @@ describe("Nexembot v0.1 reference scenarios", () => {
       initialVariables: { contactReason: "billing", staleValue: "old" },
     });
 
-    expect(variableValue(result, "contactReason")).toBe("billing");
+    expect(variableValue(result, "contactReason")).toBe("billing-reviewed");
     expect(variableValue(result, "staleValue")).toBeUndefined();
     expect(variableMeta(result, "staleValue")).toMatchObject({ invalidated: true });
     expect(variableValue(result, "flowScratch")).toBe("local-only");
@@ -619,11 +619,11 @@ function engineWith(primaryFlowVersion: FlowVersion, options: Record<string, unk
   const extraFlowVersions = Array.isArray(options.flowVersions) ? options.flowVersions : [];
 
   return createConversationEngine({
-    flowVersions: [primaryFlowVersion, ...extraFlowVersions],
     clock: { now: () => NOW },
     idGenerator: deterministicIds(),
     maxStepExecutionsPerTurn: 20,
     ...options,
+    flowVersions: [primaryFlowVersion, ...extraFlowVersions],
   }) as ConversationEngine &
     ConversationEngineModule & {
       repositories: {

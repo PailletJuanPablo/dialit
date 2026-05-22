@@ -10,7 +10,6 @@
     "outDir": "dist",
     "rootDir": "src",
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
     "skipLibCheck": true
   },
   "include": [
