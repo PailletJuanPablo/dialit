@@ -19,6 +19,7 @@ import type {
     MissingVariableReferenceRuntimeError,
     OutboundMessage,
     RuntimeClock,
+    ScopedVariableValues,
     TraceBuildInput,
     TurnId,
     VariableHistoryEntry,
@@ -31,13 +32,13 @@ import type {
 
 const defaultVariableScope: VariableScope = "conversation";
 
-type FlatVariables = Record<VariableId, VariableValue> & {
-    history?: Record<VariableId, VariableHistoryEntry[]>;
-};
+type FlatVariables = Record<VariableId, VariableValue>;
+
+type RuntimeVariables = FlatVariables | ScopedVariableValues;
 
 type RuntimeVariableState = Omit<ConversationState, "variables" | "variableHistory"> & {
-    variables: ConversationState["variables"] | FlatVariables;
-    variableHistory?: ConversationState["variableHistory"] | Record<VariableId, VariableHistoryEntry[]>;
+    variables: RuntimeVariables;
+    variableHistory?: ConversationState["variableHistory"] | VariableHistoryEntry[];
 };
 
 export type VariableLookupResult =
@@ -502,13 +503,6 @@ function appendVariableHistory(state: RuntimeVariableState, entry: VariableHisto
         variableHistory[entry.variableId] = entries;
     }
 
-    if (isFlatVariables(state.variables)) {
-        const history = state.variables.history ?? {};
-        const entries = history[entry.variableId] ?? [];
-        entries.push(clone(entry));
-        history[entry.variableId] = entries;
-        state.variables.history = history;
-    }
 }
 
 function isFlatVariables(variables: RuntimeVariableState["variables"]): variables is FlatVariables {

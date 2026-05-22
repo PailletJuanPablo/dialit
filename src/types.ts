@@ -662,6 +662,7 @@ export interface SetVariableOperation extends BaseOperation<"set_variable"> {
     variableId: VariableId;
     scope?: VariableScope;
     value: ValueExpression;
+    source?: VariableValueSource;
 }
 
 export interface UnsetVariableOperation extends BaseOperation<"unset_variable"> {
@@ -899,7 +900,8 @@ export interface GlobalCommandPolicy {
 
 export type SemanticInputTaskMode =
     | "after_invalid_input"
-    | "after_valid_capture";
+    | "after_valid_capture"
+    | "menu_selection";
 
 export interface SemanticInputTask<TOutcome extends StepOutcome = StepOutcome, TVariableId extends VariableId = VariableId>
     extends LabelledEntity {
@@ -1052,6 +1054,8 @@ export interface SemanticInputResolution<TOutcome extends StepOutcome = StepOutc
     taskId?: TaskId;
     allowedOutcomes: readonly TOutcome[];
     allowedVariableIds?: readonly TVariableId[];
+    confidence?: number;
+    variables?: Partial<Record<TVariableId, unknown>>;
 }
 
 /* ============================================================
@@ -1074,8 +1078,9 @@ export interface ConversationState {
     flowVersionId: FlowVersionId;
     status: ConversationStatus;
     currentStepId: StepId;
-    variables: ScopedVariableValues;
-    variableHistory?: VariableHistoryEntry[];
+    variables: ConversationVariableValues;
+    scopedVariables?: ScopedVariableValuesByKey;
+    variableHistory?: ConversationVariableHistory;
     executionStack: FlowExecutionFrame[];
     pendingInput?: PendingInputState;
     lastUserInput?: UserInput;
@@ -1083,6 +1088,12 @@ export interface ConversationState {
     version: number;
     updatedAt: ISODateString;
 }
+
+export type ConversationVariableValues = Record<VariableId, VariableValue>;
+
+export type ScopedVariableValuesByKey = Record<string, VariableValue>;
+
+export type ConversationVariableHistory = Record<VariableId, VariableHistoryEntry[]>;
 
 export interface FlowExecutionFrame {
     frameId: ExecutionFrameId;
@@ -1296,7 +1307,7 @@ export interface ConversationEvent {
     flowVersionId: FlowVersionId;
     stepId?: StepId;
     type: ConversationEventType;
-    payload?: JsonObject;
+    payload?: Metadata;
     createdAt: ISODateString;
     metadata?: Metadata;
 }
@@ -1308,7 +1319,7 @@ export interface ConversationEvent {
 export interface TraceFragment {
     source: string;
     message?: string;
-    data?: JsonObject;
+    data?: Metadata;
     startedAt?: ISODateString;
     completedAt?: ISODateString;
 }
@@ -1470,7 +1481,7 @@ export interface BaseRuntimeError<TCode extends RuntimeErrorCode> {
     code: TCode;
     message: string;
     recoverable: boolean;
-    details?: JsonObject;
+    details?: Metadata;
 }
 
 export interface MissingStepHandlerRuntimeError extends BaseRuntimeError<"missing_step_handler"> {
@@ -2247,7 +2258,7 @@ export interface CreateEventRequest {
     flowVersionId: FlowVersionId;
     stepId?: StepId;
     type: ConversationEventType;
-    payload?: JsonObject;
+    payload?: Metadata;
     metadata?: Metadata;
 }
 

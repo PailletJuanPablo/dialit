@@ -1,50 +1,141 @@
 import type {
   ActionDefinition,
+  ActionExecutionContext,
   AttachmentInput,
+  AttachmentStepDefinition,
+  CallFlowOperation,
+  ConditionExpression,
+  ConditionStepDefinition,
   Conversation,
   ConversationEngine,
   ConversationEngineModule,
   ConversationEngineRepositories,
   ConversationEvent,
+  ConversationEventType,
   ConversationEngineConfig,
   CreateConversationEngineOptions,
   ConversationState,
+  CustomOperation,
+  CustomOperationResult,
   DecisionTrace,
   FlowCallStatus,
+  FlowExecutionFrame,
   FlowVersion,
+  HandoffOperation,
+  IdGenerator,
+  InputProcessingContext,
+  InputStepDefinition,
+  InvalidInputBehavior,
+  LlmGeneratedResponse,
+  LlmUsageRecord,
+  MenuOption,
+  MenuStepDefinition,
+  MessageStepDefinition,
+  Metadata,
+  OperationExecutionContext,
+  OperationResult,
   OutboundMessage,
+  PendingInputState,
   ProcessTurnResult,
+  ResponsePlan,
+  ResponseRenderingContext,
   RuntimeContext,
   RuntimeError,
+  RuntimeClock,
   RuntimeServices,
+  SemanticInputResolution,
+  SemanticInputTask,
   StepBranch,
   StepDefinition,
+  StepExecutionContext,
+  StepHandler,
   StepOperation,
+  StepOutcome,
+  StepResult,
   StepTarget,
+  TraceBuildInput,
+  TraceFragment,
   Turn,
   UserInput,
+  ValidatorDefinition,
+  VariableHistoryEntry,
+  VariableId,
   VariablePatch,
   VariableScope,
+  VariableValue,
   VariableValueSource,
+  ValueExpression,
 } from "./types.js";
 
-type EngineOptions = CreateConversationEngineOptions & {
-  flowVersions?: FlowVersion[];
-  clock?: { now(): string };
-  idGenerator?: Partial<Record<string, () => string>>;
-  maxStepExecutionsPerTurn?: number;
-  actionHandlers?: Record<string, ((action: ActionDefinition, input: Record<string, unknown>, context: unknown) => Promise<unknown>) | { execute(action: ActionDefinition, input: Record<string, unknown>, context: unknown): Promise<unknown> }>;
-  customOperations?: Record<string, { outcomes?: string[]; outputVariables?: string[]; execute(operation: StepOperation, input: Record<string, unknown>, context: unknown): Promise<unknown> }>;
-  stepHandlers?: Record<string, { stepType: string; enter(context: unknown): Promise<unknown>; handleInput?(context: unknown, input: UserInput): Promise<unknown>; validate?: unknown }>;
-  semanticInputResolver?: ((input: UserInput, task: unknown, context: unknown) => Promise<unknown>) | { resolve(input: UserInput, task: unknown, context: unknown): Promise<unknown> };
-  llmResponseGenerator?: ((plan: unknown, context: unknown) => Promise<unknown>) | { generate(plan: unknown, context: unknown): Promise<unknown> };
+type EngineOptions = CreateConversationEngineOptions;
+
+type IdFactoryName = keyof IdGenerator;
+
+type RuntimeVariableValue = VariableValue & {
+  metadata?: Metadata;
 };
 
 type InternalState = Omit<ConversationState, "variables" | "variableHistory"> & {
-  variables: Record<string, { variableId: string; scope?: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> }>;
-  scopedVariables: Record<string, { variableId: string; scope: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> }>;
-  variableHistory: Record<string, Array<Record<string, unknown>>>;
+  variables: Record<VariableId, RuntimeVariableValue>;
+  scopedVariables: Record<string, RuntimeVariableValue>;
+  variableHistory: Record<VariableId, VariableHistoryEntry[]>;
   __flowScopes?: Record<string, VariableScope>;
+};
+
+type FlowCallFrameMetadata = Metadata & {
+  kind: "flow_call";
+  operation: RuntimeCallFlowOperation;
+  parentFrame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">;
+  parentScopedVariables: InternalState["scopedVariables"];
+  parentVariableHistory: InternalState["variableHistory"];
+  childScopedVariables: InternalState["scopedVariables"];
+  childVariableHistory: InternalState["variableHistory"];
+  continuation?: OperationContinuation;
+};
+
+type FlowCallExecutionFrame = FlowExecutionFrame & {
+  metadata: FlowCallFrameMetadata;
+};
+
+type RuntimeHandoffOperation = HandoffOperation & {
+  queueId?: string;
+  saveHandoffIdToVariableId?: VariableId;
+};
+
+type RuntimeCallFlowOperation = CallFlowOperation & {
+  sharedVariableIds?: VariableId[];
+};
+
+type RuntimeCustomOperationResult = (CustomOperationResult | OperationResult) & {
+  variablePatches?: VariablePatch[];
+  trace?: TraceFragment;
+};
+
+type ResultBranch = {
+  match: {
+    type: "outcome" | "status" | "error_code";
+    outcome?: StepOutcome;
+    status?: string;
+    errorCode?: string;
+  };
+  branch: StepBranch;
+};
+
+type BranchMatchResult = {
+  outcome?: StepOutcome | string;
+  status?: string;
+  errorCode?: string;
+  handoffId?: string;
+};
+
+type RenderedOutput = {
+  messages: OutboundMessage[];
+  events: ConversationEvent[];
+  fragments: TraceFragment[];
+};
+
+type StepWaitState = Partial<PendingInputState> & {
+  stepId?: string;
 };
 
 type TurnContext = {
@@ -54,9 +145,9 @@ type TurnContext = {
   turn: Turn;
   messages: OutboundMessage[];
   events: ConversationEvent[];
-  fragments: Array<Record<string, unknown>>;
+  fragments: TraceFragment[];
   patches: VariablePatch[];
-  llmUsage: Array<Record<string, unknown>>;
+  llmUsage: LlmUsageRecord[];
   initialStepId?: string;
   error?: RuntimeError;
   nested?: boolean;
@@ -70,8 +161,8 @@ type StepRunResult = {
   messages?: OutboundMessage[];
   events?: ConversationEvent[];
   patches?: VariablePatch[];
-  fragments?: Array<Record<string, unknown>>;
-  waitState?: Record<string, unknown>;
+  fragments?: TraceFragment[];
+  waitState?: StepWaitState;
   error?: RuntimeError;
 };
 
@@ -84,7 +175,7 @@ type OperationContinuation = {
   pendingTarget?: StepTarget;
   parentOutcome?: string;
   hadBranch?: boolean;
-  parentOperation?: Record<string, unknown>;
+  parentOperation?: StepOperation;
   parentOperationOutcome?: string;
   parentOperationTarget?: StepTarget;
   parentContinuation?: OperationContinuation;
@@ -119,8 +210,8 @@ class Runtime {
   private readonly internalRepositories: ConversationEngineRepositories;
   private readonly repositories: ConversationEngineRepositories;
   private readonly runtimeContext: RuntimeContext;
-  private readonly clock: { now(): string };
-  private readonly idGenerator: Record<string, () => string>;
+  private readonly clock: RuntimeClock;
+  private readonly idGenerator: IdGenerator;
   private readonly maxStepExecutionsPerTurn: number;
   private serviceModule?: RuntimeServices;
 
@@ -130,6 +221,7 @@ class Runtime {
     let counter = 0;
     const next = (prefix: string) => `${prefix}-${++counter}`;
     this.idGenerator = {
+      newFlowVersionId: () => next("flow-version"),
       newConversationId: () => next("conversation"),
       newTurnId: () => next("turn"),
       newMessageId: () => next("message"),
@@ -138,8 +230,8 @@ class Runtime {
       newCandidateId: () => next("candidate"),
       newExecutionFrameId: () => next("frame"),
       newHandoffId: () => next("handoff"),
-      ...(options.runtime?.idGenerator as Record<string, () => string> | undefined),
-      ...(options.idGenerator as Record<string, () => string> | undefined),
+      ...(options.runtime?.idGenerator ?? {}),
+      ...(options.idGenerator ?? {}),
     };
     const config: ConversationEngineConfig = {
       ...(options.runtime?.config ?? {}),
@@ -160,7 +252,7 @@ class Runtime {
         maxStepExecutionsPerTurn: this.maxStepExecutionsPerTurn,
       },
       clock: this.clock,
-      idGenerator: this.idGenerator as any,
+      idGenerator: this.idGenerator,
     };
   }
 
@@ -189,9 +281,9 @@ class Runtime {
         },
       },
       states: {
-        getByConversationId: async (conversationId) => clone(this.states.get(conversationId)) as any,
+        getByConversationId: async (conversationId) => clone(this.states.get(conversationId)),
         save: async (state) => {
-          this.states.set(state.conversationId, clone(state as unknown as InternalState));
+          this.states.set(state.conversationId, this.toInternalState(clone(state)));
         },
       },
       events: {
@@ -219,13 +311,13 @@ class Runtime {
     if (this.serviceModule) return this.serviceModule;
     const internalServices: RuntimeServices = {
       stepRegistry: {
-        register: (handler: any) => {
+        register: (handler: StepHandler) => {
           this.options.stepHandlers = { ...(this.options.stepHandlers ?? {}), [handler.stepType]: handler };
         },
         getHandler: (stepType: string) => {
           const handler = this.options.stepHandlers?.[stepType];
           if (!handler) throw this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${stepType} is not registered.`, false);
-          return handler as any;
+          return handler;
         },
         hasHandler: (stepType: string) => builtInStepTypes.has(stepType) || Boolean(this.options.stepHandlers?.[stepType]),
       },
@@ -245,34 +337,36 @@ class Runtime {
         },
       },
       actionExecutor: {
-        execute: async (action: ActionDefinition, input: Record<string, unknown>, context: unknown) => {
+        execute: async (action: ActionDefinition, input: Record<string, unknown>, context: ActionExecutionContext) => {
           const handler = this.options.actionHandlers?.[action.kind];
           if (!handler) throw this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false);
-          return typeof handler === "function" ? handler(action, input, context as any) as any : handler.execute(action, input, context as any) as any;
+          return typeof handler === "function" ? handler(action, input, context) : handler.execute(action, input, context);
         },
       },
       conditionEvaluator: {
-        evaluate: async (condition: any, context: any) => ({ matched: this.evaluateCondition({ ...context, fragments: [] } as TurnContext, condition) }),
+        evaluate: async (condition, context) => ({
+          matched: this.evaluateCondition(this.conditionEvaluationContext(context), condition),
+        }),
       },
       transitionResolver: {
-        resolveFromStepResult: async (step: StepDefinition, result: any) => result.branch ?? (result.outcome ? this.resolveRoute(step, result.outcome) : undefined),
+        resolveFromStepResult: async (step: StepDefinition, result: StepResult) => result.branch ?? (result.outcome ? this.resolveRoute(step, result.outcome) : undefined),
         resolveFromOutcome: async (step: StepDefinition, outcome: string) => this.resolveRoute(step, outcome),
       },
       stateReducer: {
         apply: (state: ConversationState) => state,
       },
       traceBuilder: {
-        build: (input: any) => ({
+        build: (input: TraceBuildInput) => ({
           traceId: this.newId("newTraceId", "trace"),
           createdAt: this.clock.now(),
           ...input,
         }),
       },
       semanticInputResolver: typeof this.options.semanticInputResolver === "function"
-        ? { resolve: this.options.semanticInputResolver as any }
+        ? { resolve: this.options.semanticInputResolver }
         : this.options.semanticInputResolver,
       llmResponseGenerator: typeof this.options.llmResponseGenerator === "function"
-        ? { generate: this.options.llmResponseGenerator as any }
+        ? { generate: this.options.llmResponseGenerator }
         : this.options.llmResponseGenerator,
     };
     this.serviceModule = { ...internalServices, ...(this.options.services ?? {}) };
@@ -282,7 +376,7 @@ class Runtime {
   private async startConversation(request: { conversationId: string; flowVersionId: string; channel?: string; userId?: string; initialVariables?: Record<string, unknown>; metadata?: Record<string, unknown> }): Promise<ProcessTurnResult> {
     const flow = await this.getFlowVersion(request.flowVersionId);
     const conversation = this.createConversation(request, flow);
-    const state = this.createInitialState(conversation, flow, request.initialVariables ?? {});
+    const state = this.createInitialState(conversation, flow);
     const turn = this.createTurn(request.conversationId);
     const context = this.createContext(flow, conversation, state, turn);
 
@@ -304,7 +398,7 @@ class Runtime {
       ? await this.getFlowVersion(activeFlowCallFrame.flowVersionId)
       : existingState ? await this.getFlowVersion(existingState.flowVersionId) : undefined;
     const safeConversation = conversation ?? this.createConversation({ conversationId: request.conversationId, flowVersionId: flow?.flowVersionId ?? "unknown" }, flow);
-    const safeState = existingState ?? this.createInitialState(safeConversation, flow, {});
+    const safeState = existingState ?? this.createInitialState(safeConversation, flow);
     const turn = this.createTurn(request.conversationId, request.input);
     const context = this.createContext(flow, safeConversation, clone(safeState), turn, request.input);
     if (activeFlowCallFrame) this.loadFlowCallChildState(context.state, activeFlowCallFrame);
@@ -354,7 +448,8 @@ class Runtime {
 
   private async getState(conversationId: string): Promise<InternalState | undefined> {
     if (this.repositories.states !== this.internalRepositories.states) {
-      return await this.repositories.states.getByConversationId(conversationId) as InternalState | undefined;
+      const state = await this.repositories.states.getByConversationId(conversationId);
+      return state ? this.toInternalState(state) : undefined;
     }
     return this.states.get(conversationId);
   }
@@ -379,26 +474,35 @@ class Runtime {
   }
 
   private async enterStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const stepType = (step as any).type as string;
+    const stepType = step.type;
     context.events.push(this.event(context, "step_entered", { stepId: step.stepId, stepType }));
     context.fragments.push({ source: `step:${stepType}`, data: { stepId: step.stepId, phase: "enter" } });
 
-    const onEnter = await this.executeOperations(context, step, (step as any).onEnter ?? [], { phase: "on_enter" });
+    const onEnter = await this.executeOperations(context, step, step.onEnter ?? [], { phase: "on_enter" });
     if (onEnter.error || onEnter.target || onEnter.status === "waiting_input") return onEnter;
 
     return this.enterStepBody(context, step);
   }
 
   private enterStepBody(context: TurnContext, step: StepDefinition): Promise<StepRunResult> | StepRunResult {
-    const stepType = (step as any).type as string;
-    if (stepType === "message") return this.enterMessageStep(context, step);
-    if (stepType === "menu") return this.enterMenuStep(context, step);
-    if (stepType === "input") return this.enterInputStep(context, step);
-    if (stepType === "attachment") return this.enterAttachmentStep(context, step);
-    if (stepType === "condition") return this.enterConditionStep(context, step);
-    if (stepType === "end") return this.enterEndStep(context, step);
-    if (stepType === "custom") return this.enterCustomStep(context, step);
-    return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${stepType} is not registered.`, false) };
+    switch (step.type) {
+      case "message":
+        return this.enterMessageStep(context, step);
+      case "menu":
+        return this.enterMenuStep(context, step);
+      case "input":
+        return this.enterInputStep(context, step);
+      case "attachment":
+        return this.enterAttachmentStep(context, step);
+      case "condition":
+        return this.enterConditionStep(context, step);
+      case "end":
+        return this.enterEndStep(context, step);
+      case "custom":
+        return this.enterCustomStep(context, step);
+      default:
+        return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${String((step as { type: string }).type)} is not registered.`, false) };
+    }
   }
 
   private async handleStepInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
@@ -439,7 +543,7 @@ class Runtime {
       target = branchResult.target ?? target;
     }
 
-    const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? [], {
+    const exitResult = await this.executeOperations(context, step, step.onExit ?? [], {
       phase: "on_exit",
       pendingTarget: target,
       parentOutcome: result.outcome,
@@ -466,13 +570,13 @@ class Runtime {
   private markWaitingInput(context: TurnContext, step: StepDefinition, result: StepRunResult): void {
     const pendingStepId = String(result.waitState?.stepId ?? step.stepId);
     context.state.status = "waiting_input";
-    context.state.pendingInput = { stepId: pendingStepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
+    context.state.pendingInput = { stepId: pendingStepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) };
     context.state.currentStepId = pendingStepId;
   }
 
-  private enterMessageStep(context: TurnContext, step: StepDefinition): StepRunResult | Promise<StepRunResult> {
-    return this.renderMany(context, step, ((step as any).config?.messages ?? []) as any[]).then((rendered) => ({
-      status: (step as any).config?.autoAdvance === false ? "waiting_input" : "completed",
+  private enterMessageStep(context: TurnContext, step: MessageStepDefinition): StepRunResult | Promise<StepRunResult> {
+    return this.renderMany(context, step, step.config.messages).then((rendered) => ({
+      status: step.config.autoAdvance === false ? "waiting_input" : "completed",
       outcome: "next",
       messages: rendered.messages,
       fragments: rendered.fragments,
@@ -481,16 +585,16 @@ class Runtime {
     }));
   }
 
-  private async enterMenuStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const rendered = await this.renderOne(context, step, (step as any).config.prompt);
-    const options = ((step as any).config.options ?? []) as Array<Record<string, any>>;
+  private async enterMenuStep(context: TurnContext, step: MenuStepDefinition): Promise<StepRunResult> {
+    const rendered = await this.renderOne(context, step, step.config.prompt);
+    const options = step.config.options ?? [];
     const prompt = rendered.messages[0];
     if (prompt) {
       prompt.content = {
         type: "rich",
-        text: (prompt.content as any).text,
+        text: prompt.content.type === "text" || prompt.content.type === "rich" ? prompt.content.text : undefined,
         buttons: options.map((option) => ({ optionId: option.optionId, label: option.label ?? option.optionId })),
-      } as any;
+      };
     }
     return {
       status: "waiting_input",
@@ -501,19 +605,19 @@ class Runtime {
     };
   }
 
-  private async enterInputStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const rendered = (step as any).config.prompt ? await this.renderOne(context, step, (step as any).config.prompt) : emptyRendered();
+  private async enterInputStep(context: TurnContext, step: InputStepDefinition): Promise<StepRunResult> {
+    const rendered = step.config.prompt ? await this.renderOne(context, step, step.config.prompt) : emptyRendered();
     return {
       status: "waiting_input",
       messages: rendered.messages,
       events: rendered.events,
       fragments: rendered.fragments,
-      waitState: { stepId: step.stepId, inputContract: (step as any).config.input },
+      waitState: { stepId: step.stepId, inputContract: step.config.input, createdAt: this.clock.now() },
     };
   }
 
-  private async enterAttachmentStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const rendered = (step as any).config.prompt ? await this.renderOne(context, step, (step as any).config.prompt) : emptyRendered();
+  private async enterAttachmentStep(context: TurnContext, step: AttachmentStepDefinition): Promise<StepRunResult> {
+    const rendered = step.config.prompt ? await this.renderOne(context, step, step.config.prompt) : emptyRendered();
     return {
       status: "waiting_input",
       messages: rendered.messages,
@@ -523,9 +627,9 @@ class Runtime {
     };
   }
 
-  private async enterConditionStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const evaluated: Array<Record<string, unknown>> = [];
-    for (const conditionBranch of ((step as any).config.branches ?? []) as Array<Record<string, any>>) {
+  private async enterConditionStep(context: TurnContext, step: ConditionStepDefinition): Promise<StepRunResult> {
+    const evaluated: Array<{ branchId: string; outcome: StepOutcome; matched: boolean }> = [];
+    for (const conditionBranch of step.config.branches ?? []) {
       const matched = this.evaluateCondition(context, conditionBranch.when);
       evaluated.push({ branchId: conditionBranch.branchId, outcome: conditionBranch.outcome, matched });
       if (matched) {
@@ -538,7 +642,7 @@ class Runtime {
         };
       }
     }
-    const defaultBranch = (step as any).config.defaultBranch;
+    const defaultBranch = step.config.defaultBranch;
     context.events.push(this.event(context, "condition_evaluated", { stepId: step.stepId, matched: false }));
     return {
       status: "completed",
@@ -548,32 +652,32 @@ class Runtime {
     };
   }
 
-  private async enterEndStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const rendered = (step as any).config.finalMessage ? await this.renderOne(context, step, (step as any).config.finalMessage) : emptyRendered();
-    return { status: "completed", target: { type: "end", status: (step as any).config.status }, messages: rendered.messages, events: rendered.events, fragments: rendered.fragments };
+  private async enterEndStep(context: TurnContext, step: Extract<StepDefinition, { type: "end" }>): Promise<StepRunResult> {
+    const rendered = step.config.finalMessage ? await this.renderOne(context, step, step.config.finalMessage) : emptyRendered();
+    return { status: "completed", target: { type: "end", status: step.config.status }, messages: rendered.messages, events: rendered.events, fragments: rendered.fragments };
   }
 
-  private async enterCustomStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
-    const customType = (step as any).config?.customType;
+  private async enterCustomStep(context: TurnContext, step: Extract<StepDefinition, { type: "custom" }>): Promise<StepRunResult> {
+    const customType = step.config.customType;
     const registry = this.services().stepRegistry;
     const handler = customType && registry.hasHandler(customType) ? registry.getHandler(customType) : undefined;
     if (!handler) return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Custom step handler ${customType} is not registered.`, false) };
-    const result = await handler.enter(this.stepContext(context, step) as any);
+    const result = await handler.enter(this.stepContext(context, step));
     return this.normalizeExternalStepResult(result);
   }
 
-  private async handleMenuInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
-    const options = ((step as any).config.options ?? []) as Array<Record<string, any>>;
-    const selection = (step as any).config.selection ?? {};
-    let selected: Record<string, any> | undefined;
+  private async handleMenuInput(context: TurnContext, step: MenuStepDefinition, input: UserInput): Promise<StepRunResult> {
+    const options = step.config.options ?? [];
+    const selection = step.config.selection;
+    let selected: MenuOption | undefined;
     let resolver = "unknown";
     let text: string | undefined;
-    if (selection.allowButtons !== false && (input as any).type === "choice" && (input as any).optionId) {
-      selected = options.find((option) => option.optionId === (input as any).optionId);
+    if (selection.allowButtons !== false && input.type === "choice" && input.optionId) {
+      selected = options.find((option) => option.optionId === input.optionId);
       resolver = "option_id";
     }
-    if (!selected && (input as any).type === "text") {
-      const inputText = String((input as any).text ?? "").trim();
+    if (!selected && input.type === "text") {
+      const inputText = input.text.trim();
       text = inputText;
       const number = Number(inputText);
       if (selection.allowNumbers !== false && Number.isInteger(number) && number >= 1 && number <= options.length) {
@@ -594,7 +698,7 @@ class Runtime {
       if (!semanticResolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
       const allowedOutcomes = options.map((option) => String(option.optionId));
       if (selection.semanticSelection.unknownOutcome) allowedOutcomes.push(String(selection.semanticSelection.unknownOutcome));
-      const task = {
+      const task: SemanticInputTask = {
         taskId: `${step.stepId}:menu_selection`,
         mode: "menu_selection",
         allowedOutcomes,
@@ -603,9 +707,9 @@ class Runtime {
       };
       context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
       const semantic = await this.callSemanticResolver(semanticResolver, input, task, this.inputContext(context, step));
-      const outcome = String((semantic as any).outcome ?? "");
-      const confidence = Number((semantic as any).confidence ?? 0);
-      const variables = (semantic as any).variables ?? {};
+      const outcome = String(semantic.outcome ?? "");
+      const confidence = Number(semantic.confidence ?? 0);
+      const variables = semantic.variables ?? {};
       if (!allowedOutcomes.includes(outcome)) {
         return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic outcome ${outcome} is not declared.`, false) };
       }
@@ -634,7 +738,7 @@ class Runtime {
       };
     }
     if (!selected) {
-      const rendered = await this.renderInvalid(context, step, (step as any).config.invalidSelection);
+      const rendered = await this.renderInvalid(context, step, step.config.invalidSelection);
       return { status: "waiting_input", messages: rendered.messages, events: [this.event(context, "input_invalid", { stepId: step.stepId })], fragments: [{ source: "menu:resolve", data: { status: "unknown" } }] };
     }
     context.events.push(this.event(context, "menu_option_selected", { stepId: step.stepId, optionId: selected.optionId }));
@@ -646,19 +750,20 @@ class Runtime {
     };
   }
 
-  private async handleInputStepInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
-    if ((input as any).type !== "text") return this.invalidInput(context, step, "Input must be text.");
-    const contract = (step as any).config.input;
+  private async handleInputStepInput(context: TurnContext, step: InputStepDefinition, input: UserInput): Promise<StepRunResult> {
+    if (input.type !== "text") return this.invalidInput(context, step, "Input must be text.");
+    const contract = step.config.input;
     const binding = contract.bindings?.[0];
-    const raw = String((input as any).text ?? "");
+    if (!binding) return { status: "failed", error: this.runtimeError("INPUT_BINDING_NOT_FOUND", `Input step ${step.stepId} has no binding.`, false) };
+    const raw = input.text;
     const value = raw.trim();
     for (const validator of binding?.validators ?? []) {
       const validation = this.validateValue(value, validator);
       if (validation.error) return { status: "failed", error: validation.error };
       if (!validation.valid) return this.invalidInput(context, step, validator.message ?? "Input is invalid.");
     }
-    const patches: VariablePatch[] = [{ type: "set", variableId: binding.targetVariableId, value, source: "user_input" } as any];
-    const fragments: Array<Record<string, unknown>> = [{ source: "input:resolve", data: { status: "resolved", variableId: binding.targetVariableId } }];
+    const patches: VariablePatch[] = [{ type: "set", variableId: binding.targetVariableId, value, source: "user_input" }];
+    const fragments: TraceFragment[] = [{ source: "input:resolve", data: { status: "resolved", variableId: binding.targetVariableId } }];
 
     for (const task of contract.semanticTasks ?? []) {
       if (task.mode !== "after_valid_capture") continue;
@@ -666,19 +771,19 @@ class Runtime {
       if (!resolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
       context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
       const semantic = await this.callSemanticResolver(resolver, input, task, this.inputContext(context, step));
-      const outcome = (semantic as any).outcome;
-      const variables = (semantic as any).variables ?? {};
-      if (!task.allowedOutcomes.includes(outcome)) {
+      const outcome = semantic.outcome;
+      const variables = semantic.variables ?? {};
+      if (outcome === undefined || !task.allowedOutcomes.includes(outcome)) {
         return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic outcome ${outcome} is not declared.`, false) };
       }
       for (const variableId of Object.keys(variables)) {
         if (task.allowedVariableIds && !task.allowedVariableIds.includes(variableId)) {
           return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic variable ${variableId} is not declared.`, false) };
         }
-        patches.push({ type: "set", variableId, value: variables[variableId], source: "semantic_input_task" } as any);
+        patches.push({ type: "set", variableId, value: variables[variableId], source: "semantic_input_task" });
       }
       if (task.saveOutcomeToVariableId && !(task.saveOutcomeToVariableId in variables)) {
-        patches.push({ type: "set", variableId: task.saveOutcomeToVariableId, value: outcome, source: "semantic_input_task" } as any);
+        patches.push({ type: "set", variableId: task.saveOutcomeToVariableId, value: outcome, source: "semantic_input_task" });
       }
       context.events.push(this.event(context, "semantic_input_task_completed", { taskId: task.taskId, outcome }));
       context.llmUsage.push({ purpose: "input_resolution", success: true });
@@ -688,17 +793,17 @@ class Runtime {
     return { status: "completed", outcome: "captured", patches, events: [this.event(context, "input_resolved", { stepId: step.stepId })], fragments };
   }
 
-  private async handleAttachmentInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
-    if ((input as any).type !== "attachment") return this.invalidInput(context, step, "Input must be an attachment.");
-    const attachment = ((input as any).attachments ?? [])[0] as AttachmentInput | undefined;
-    const rules = (step as any).config.rules ?? {};
+  private async handleAttachmentInput(context: TurnContext, step: AttachmentStepDefinition, input: UserInput): Promise<StepRunResult> {
+    if (input.type !== "attachment") return this.invalidInput(context, step, "Input must be an attachment.");
+    const attachment = input.attachments[0] as AttachmentInput | undefined;
+    const rules = step.config.rules;
     const extension = attachment?.filename?.slice(attachment.filename.lastIndexOf(".")).toLowerCase();
     const valid = attachment !== undefined
       && (!rules.allowedMimeTypes || rules.allowedMimeTypes.includes(attachment.mimeType))
-      && (!rules.allowedExtensions || rules.allowedExtensions.includes(extension))
+      && (!rules.allowedExtensions || (extension !== undefined && rules.allowedExtensions.includes(extension)))
       && (!rules.maxSizeMb || attachment.sizeBytes <= rules.maxSizeMb * 1024 * 1024);
     if (!valid) {
-      const rendered = await this.renderInvalid(context, step, (step as any).config.invalidAttachment);
+      const rendered = await this.renderInvalid(context, step, step.config.invalidAttachment);
       return {
         status: "waiting_input",
         messages: rendered.messages,
@@ -711,25 +816,25 @@ class Runtime {
     return {
       status: "completed",
       outcome: "captured",
-      patches: [{ type: "set", variableId: (step as any).config.targetVariableId, value: attachment, source: "attachment" } as any],
+      patches: [{ type: "set", variableId: step.config.targetVariableId, value: attachment, source: "attachment" }],
       events: [this.event(context, "input_resolved", { stepId: step.stepId })],
       fragments: [{ source: "attachment:validate", data: { valid: true, filename: attachment?.filename, mimeType: attachment?.mimeType } }],
     };
   }
 
-  private async handleCustomStepInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
-    const customType = (step as any).config?.customType;
+  private async handleCustomStepInput(context: TurnContext, step: Extract<StepDefinition, { type: "custom" }>, input: UserInput): Promise<StepRunResult> {
+    const customType = step.config.customType;
     const registry = this.services().stepRegistry;
     const handler = customType && registry.hasHandler(customType) ? registry.getHandler(customType) : undefined;
     if (!handler?.handleInput) return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Custom step handler ${customType} is not registered.`, false) };
-    const result = await handler.handleInput(this.stepContext(context, step) as any, input);
+    const result = await handler.handleInput(this.stepContext(context, step), input);
     return this.normalizeExternalStepResult(result);
   }
 
   private async invalidInput(context: TurnContext, step: StepDefinition, reason: unknown): Promise<StepRunResult> {
-    const semantic = await this.resolveSemanticAfterInvalidInput(context, step);
+    const semantic = step.type === "input" ? await this.resolveSemanticAfterInvalidInput(context, step) : undefined;
     if (semantic) return semantic;
-    const rendered = await this.renderInvalid(context, step, (step as any).config.input?.invalidBehavior);
+    const rendered = await this.renderInvalid(context, step, step.type === "input" ? step.config.input.invalidBehavior : undefined);
     return {
       status: "waiting_input",
       messages: rendered.messages,
@@ -739,17 +844,17 @@ class Runtime {
     };
   }
 
-  private async renderInvalid(context: TurnContext, step: StepDefinition, behavior: any) {
+  private async renderInvalid(context: TurnContext, step: StepDefinition, behavior: InvalidInputBehavior | undefined): Promise<RenderedOutput> {
     const messages: OutboundMessage[] = [];
     const events: ConversationEvent[] = [];
-    const fragments: Array<Record<string, unknown>> = [];
+    const fragments: TraceFragment[] = [];
     if (behavior?.message) {
       const rendered = await this.renderOne(context, step, behavior.message);
       messages.push(...rendered.messages);
       events.push(...rendered.events);
       fragments.push(...rendered.fragments);
     }
-    const prompt = (step as any).config.prompt;
+    const prompt = this.stepPrompt(step);
     if (prompt) {
       const rendered = await this.renderOne(context, step, prompt);
       messages.push(...rendered.messages);
@@ -759,17 +864,19 @@ class Runtime {
     return { messages, events, fragments };
   }
 
-  private async resolveSemanticAfterInvalidInput(context: TurnContext, step: StepDefinition): Promise<StepRunResult | undefined> {
-    const tasks = ((step as any).config.input?.semanticTasks ?? []).filter((task: any) => task.mode === "after_invalid_input");
+  private async resolveSemanticAfterInvalidInput(context: TurnContext, step: InputStepDefinition): Promise<StepRunResult | undefined> {
+    const tasks = (step.config.input.semanticTasks ?? []).filter((task) => task.mode === "after_invalid_input");
     if (tasks.length === 0) return undefined;
     const resolver = this.services().semanticInputResolver;
     if (!resolver) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED", "Semantic input resolver is not registered.", false) };
     const task = tasks[0];
+    if (!task) return undefined;
+    if (!context.turn.userInput) return { status: "failed", error: this.runtimeError("SEMANTIC_INPUT_NOT_FOUND", "Semantic input resolution requires the current user input.", false) };
     context.events.push(this.event(context, "semantic_input_task_started", { taskId: task.taskId }));
-    const semantic = await this.callSemanticResolver(resolver, context.turn.userInput as UserInput, task, this.inputContext(context, step));
-    const outcome = (semantic as any).outcome;
-    const variables = (semantic as any).variables ?? {};
-    if (!task.allowedOutcomes.includes(outcome)) {
+    const semantic = await this.callSemanticResolver(resolver, context.turn.userInput, task, this.inputContext(context, step));
+    const outcome = semantic.outcome;
+    const variables = semantic.variables ?? {};
+    if (outcome === undefined || !task.allowedOutcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic outcome ${outcome} is not declared.`, false) };
     }
     const patches: VariablePatch[] = [];
@@ -777,7 +884,7 @@ class Runtime {
       if (task.allowedVariableIds && !task.allowedVariableIds.includes(variableId)) {
         return { status: "failed", error: this.runtimeError("SEMANTIC_RESULT_OUT_OF_CONTRACT", `Semantic variable ${variableId} is not declared.`, false) };
       }
-      patches.push({ type: "set", variableId, value: variables[variableId], source: "semantic_input_task" } as any);
+      patches.push({ type: "set", variableId, value: variables[variableId], source: "semantic_input_task" });
     }
     context.events.push(this.event(context, "semantic_input_task_completed", { taskId: task.taskId, outcome }));
     context.llmUsage.push({ purpose: "input_resolution", success: true });
@@ -789,7 +896,7 @@ class Runtime {
     };
   }
 
-  private validateValue(value: string, validator: any): { valid: boolean; error?: RuntimeError } {
+  private validateValue(value: string, validator: ValidatorDefinition): { valid: boolean; error?: RuntimeError } {
     if (validator.type === "regex") return { valid: new RegExp(String(validator.options?.pattern ?? "")).test(value) };
     if (validator.type === "integer") return { valid: /^-?\d+$/.test(value) };
     if (validator.type === "number") return { valid: !Number.isNaN(Number(value)) };
@@ -797,12 +904,15 @@ class Runtime {
     if (validator.type === "email") return { valid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) };
     if (validator.type === "min_length") return { valid: value.length >= Number(validator.options?.min ?? validator.options?.value ?? 0) };
     if (validator.type === "max_length") return { valid: value.length <= Number(validator.options?.max ?? validator.options?.value ?? Number.MAX_SAFE_INTEGER) };
-    if (validator.type === "enum") return { valid: (validator.options?.values ?? []).includes(value) };
+    if (validator.type === "enum") {
+      const values = validator.options?.values;
+      return { valid: Array.isArray(values) && values.includes(value) };
+    }
     return { valid: false, error: this.runtimeError("VALIDATOR_NOT_REGISTERED", `Validator ${validator.type} is not registered.`, false) };
   }
 
   private async executeBranch(context: TurnContext, step: StepDefinition, branch: StepBranch, continuation?: OperationContinuationBase): Promise<StepRunResult> {
-    const operationResult = await this.executeOperations(context, step, (branch as any).operations ?? [], continuation ?? {
+    const operationResult = await this.executeOperations(context, step, branch.operations ?? [], continuation ?? {
       phase: "branch",
       branchTarget: branch.target,
       hadBranch: true,
@@ -820,8 +930,9 @@ class Runtime {
     initialTarget?: StepTarget,
   ): Promise<StepRunResult> {
     const aggregate: StepRunResult = { status: "completed", target: initialTarget, messages: [], events: [], patches: [], fragments: [] };
-    for (let index = startIndex; index < (operations as any[]).length; index++) {
-      const operation = (operations as any[])[index];
+    for (let index = startIndex; index < operations.length; index++) {
+      const operation = operations[index];
+      if (!operation) continue;
       if (!builtInOperationTypes.has(operation.type)) {
         return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operation.type} is not registered.`, false) };
       }
@@ -842,7 +953,7 @@ class Runtime {
   private async consumeOperationResult(
     context: TurnContext,
     step: StepDefinition,
-    operation: any,
+    operation: StepOperation,
     result: StepRunResult,
     aggregate: StepRunResult,
     continuation?: OperationContinuation,
@@ -872,7 +983,7 @@ class Runtime {
     return undefined;
   }
 
-  private async executeOperation(context: TurnContext, step: StepDefinition, operation: any, continuation?: OperationContinuation): Promise<StepRunResult> {
+  private async executeOperation(context: TurnContext, step: StepDefinition, operation: StepOperation, continuation?: OperationContinuation): Promise<StepRunResult> {
     if (operation.type === "send_message") {
       const rendered = await this.renderOne(context, step, operation.message);
       return { status: "completed", messages: rendered.messages, events: rendered.events, fragments: [{ source: "operation:send_message", data: { operationId: operation.operationId } }, ...rendered.fragments] };
@@ -884,19 +995,19 @@ class Runtime {
       if (context.error) return { status: "failed", error: context.error };
       return {
         status: "completed",
-        patches: [{ type: "set", variableId: operation.variableId, value, source: operation.source ?? "operation", metadata: { operationId: operation.operationId }, scope: operation.scope } as any],
+        patches: [{ type: "set", variableId: operation.variableId, value, source: operation.source ?? "operation", metadata: { operationId: operation.operationId }, scope: operation.scope }],
         fragments: [{ source: "variable:write", data: { variableId: operation.variableId, scope: this.variableScope(context.flow, operation.variableId, operation.scope), operationId: operation.operationId } }],
       };
     }
     if (operation.type === "unset_variable") {
       const error = this.ensureVariable(context.flow, operation.variableId);
       if (error) return { status: "failed", error };
-      return { status: "completed", patches: [{ type: "unset", variableId: operation.variableId, source: "operation", metadata: { operationId: operation.operationId }, scope: operation.scope } as any] };
+      return { status: "completed", patches: [{ type: "unset", variableId: operation.variableId, source: "operation", metadata: { operationId: operation.operationId }, scope: operation.scope }] };
     }
     if (operation.type === "invalidate_variable") {
       const error = this.ensureVariable(context.flow, operation.variableId);
       if (error) return { status: "failed", error };
-      return { status: "completed", patches: [{ type: "invalidate", variableId: operation.variableId, source: "operation", metadata: { operationId: operation.operationId, invalidated: true }, scope: operation.scope } as any] };
+      return { status: "completed", patches: [{ type: "invalidate", variableId: operation.variableId, source: "operation", metadata: { operationId: operation.operationId, invalidated: true }, scope: operation.scope }] };
     }
     if (operation.type === "run_action") return this.executeAction(context, step, operation);
     if (operation.type === "call_flow") return this.executeFlowCall(context, step, operation, continuation);
@@ -907,11 +1018,11 @@ class Runtime {
       if (context.error) return { status: "failed", error: context.error };
       return { status: "completed", events: [this.event(context, operation.eventType, payload)], fragments: [{ source: "operation:emit_event", data: { eventType: operation.eventType } }] };
     }
-    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operation.type} is not registered.`, false) };
+    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${(operation as { type: string }).type} is not registered.`, false) };
   }
 
-  private async executeAction(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
-    const action = (context.flow.definition.actions ?? []).find((candidate: any) => candidate.actionId === operation.actionId) as any;
+  private async executeAction(context: TurnContext, step: StepDefinition, operation: Extract<StepOperation, { type: "run_action" }>): Promise<StepRunResult> {
+    const action = (context.flow.definition.actions ?? []).find((candidate) => candidate.actionId === operation.actionId);
     if (!action) return { status: "failed", error: this.runtimeError("ACTION_NOT_FOUND", `Action ${operation.actionId} was not found.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
     if (context.error) return { status: "failed", error: context.error };
@@ -919,8 +1030,8 @@ class Runtime {
     const handler = this.options.actionHandlers?.[action.kind];
     if (!handler && !this.options.services?.actionExecutor) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
     const result = this.options.services?.actionExecutor
-      ? await this.options.services.actionExecutor.execute(action, input, this.actionContext(context, step) as any) as any
-      : await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step) as any) : handler!.execute(action, input, this.actionContext(context, step) as any)) as any;
+      ? await this.options.services.actionExecutor.execute(action, input, this.actionContext(context, step))
+      : await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step)) : handler!.execute(action, input, this.actionContext(context, step)));
     const outcome = result.outcome ?? result.status;
     if (action.resultOutcomes && outcome && !action.resultOutcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("ACTION_RESULT_OUT_OF_CONTRACT", `Action outcome ${outcome} is not declared.`, false) };
@@ -944,12 +1055,12 @@ class Runtime {
     };
   }
 
-  private async executeCustomOperation(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
+  private async executeCustomOperation(context: TurnContext, step: StepDefinition, operation: CustomOperation): Promise<StepRunResult> {
     const contract = this.options.customOperations?.[operation.customType];
     if (!contract) return { status: "failed", error: this.runtimeError("CUSTOM_OPERATION_CONTRACT_NOT_REGISTERED", `Custom operation ${operation.customType} is not registered.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
     if (context.error) return { status: "failed", error: context.error };
-    const result = await contract.execute(operation, input, this.operationContext(context, step)) as any;
+    const result: RuntimeCustomOperationResult = await contract.execute(operation, input, this.operationContext(context, step));
     const outcome = result.outcome ?? result.status;
     if (contract.outcomes && outcome && !contract.outcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("CUSTOM_OPERATION_RESULT_OUT_OF_CONTRACT", `Custom operation outcome ${outcome} is not declared.`, false) };
@@ -973,7 +1084,7 @@ class Runtime {
     };
   }
 
-  private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any, continuation?: OperationContinuation): Promise<StepRunResult> {
+  private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: RuntimeCallFlowOperation, continuation?: OperationContinuation): Promise<StepRunResult> {
     const childFlow = await this.getFlowVersion(operation.flowVersionId);
     if (!childFlow) return { status: "failed", error: this.runtimeError("FLOW_VERSION_NOT_FOUND", `Flow version ${operation.flowVersionId} was not found.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
@@ -986,7 +1097,7 @@ class Runtime {
     childContext.state.currentStepId = childFlow.definition.startStepId;
     childContext.state.status = "active";
     for (const [variableId, value] of Object.entries(input)) {
-      this.applyPatch(childContext, { type: "set", variableId, value, source: "flow_call" } as any);
+      this.applyPatch(childContext, { type: "set", variableId, value, source: "flow_call" });
     }
     context.events.push(this.event(context, "flow_call_started", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId }));
     await this.runAutomaticSteps(childContext);
@@ -1002,7 +1113,7 @@ class Runtime {
       context.events.push(this.event(context, "flow_call_waiting_input", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, stepId: childCurrentStepId }));
       return {
         status: "waiting_input",
-        waitState: childPendingInput as Record<string, unknown>,
+        waitState: childPendingInput,
         fragments: [{ source: "operation:call_flow", data: { operationId: operation.operationId, flowVersionId: childFlow.flowVersionId, status: "waiting_input" } }],
       };
     }
@@ -1018,7 +1129,7 @@ class Runtime {
     if (output.error) return { status: "failed", error: output.error };
     context.state.status = "active";
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: childStatus }));
-    const result = { status: childStatus, outcome: childStatus };
+    const result: BranchMatchResult = { status: childStatus, outcome: childStatus };
     const branch = this.matchResultBranch(operation.onResult ?? [], result);
     return {
       status: "completed",
@@ -1056,14 +1167,14 @@ class Runtime {
   private createFlowCallFrame(
     childFlow: FlowVersion,
     step: StepDefinition,
-    operation: any,
+    operation: RuntimeCallFlowOperation,
     parentFrame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">,
     parentScopedVariables: InternalState["scopedVariables"],
     parentVariableHistory: InternalState["variableHistory"],
     childScopedVariables: InternalState["scopedVariables"],
     childVariableHistory: InternalState["variableHistory"],
     continuation?: OperationContinuation,
-  ) {
+  ): FlowCallExecutionFrame {
     return {
       frameId: this.newId("newExecutionFrameId", "frame"),
       flowVersionId: childFlow.flowVersionId,
@@ -1092,13 +1203,13 @@ class Runtime {
     throw new Error(`Flow call finished with non-terminal status ${status}.`);
   }
 
-  private activeFlowCallFrame(state: InternalState) {
+  private activeFlowCallFrame(state: InternalState): FlowCallExecutionFrame | undefined {
     const frame = state.executionStack.at(-1);
-    return (frame?.metadata as any)?.kind === "flow_call" ? frame : undefined;
+    return this.isFlowCallFrame(frame) ? frame : undefined;
   }
 
-  private loadFlowCallChildState(state: InternalState, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>): void {
-    const metadata = frame.metadata as any;
+  private loadFlowCallChildState(state: InternalState, frame: FlowCallExecutionFrame): void {
+    const metadata = frame.metadata;
     state.scopedVariables = clone(metadata.childScopedVariables ?? {});
     state.variableHistory = clone(metadata.childVariableHistory ?? {});
     this.rebuildVariablesFromScoped(state);
@@ -1126,7 +1237,7 @@ class Runtime {
     }
   }
 
-  private flowCallSharingPolicy(operation: any): { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> } {
+  private flowCallSharingPolicy(operation: RuntimeCallFlowOperation): { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> } {
     const sharing = operation.variableSharing;
     const includeValues = sharing?.includeVariableIds ?? operation.sharedVariableIds;
     return {
@@ -1208,14 +1319,14 @@ class Runtime {
         value: sourceValue.value,
         source: "flow_call",
         metadata: { operationId, sourceVariableId },
-      } as any);
+      });
       outputVariables.push(targetVariableId);
     }
     return { patches, outputVariables: outputVariables.sort() };
   }
 
-  private async finishFlowCallInputTurn(context: TurnContext, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>, childError?: RuntimeError): Promise<ProcessTurnResult> {
-    const metadata = frame.metadata as any;
+  private async finishFlowCallInputTurn(context: TurnContext, frame: FlowCallExecutionFrame, childError?: RuntimeError): Promise<ProcessTurnResult> {
+    const metadata = frame.metadata;
     const parentFlow = await this.getFlowVersion(context.state.flowVersionId);
     if (!parentFlow) return this.fail(context, "FLOW_VERSION_NOT_FOUND", `Flow version ${context.state.flowVersionId} was not found.`, false);
 
@@ -1256,7 +1367,7 @@ class Runtime {
     const sharingResult = this.restoreFlowCallVariables(context.state, metadata.parentScopedVariables, childScopedVariables, sharing);
     context.state.variableHistory = metadata.parentVariableHistory;
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: frame.flowVersionId, operationId: operation.operationId, status: childStatus }));
-    const result = { status: childStatus, outcome: childStatus };
+    const result: BranchMatchResult = { status: childStatus, outcome: childStatus };
     const flowCallResult: StepRunResult = {
       status: "completed",
       outcome: childStatus,
@@ -1274,7 +1385,7 @@ class Runtime {
         },
       }],
     };
-    const continuation = metadata.continuation as OperationContinuation | undefined;
+    const continuation = metadata.continuation;
     if (continuation) {
       const operationResult = await this.resumeOperationListAfterFlowCall(context, parentStep, operation, flowCallResult, continuation);
       if (operationResult.error) return this.failWithError(context, operationResult.error);
@@ -1295,7 +1406,7 @@ class Runtime {
   private async resumeOperationListAfterFlowCall(
     context: TurnContext,
     step: StepDefinition,
-    operation: any,
+    operation: StepOperation,
     result: StepRunResult,
     continuation: OperationContinuation,
   ): Promise<StepRunResult> {
@@ -1413,7 +1524,7 @@ class Runtime {
     target: StepTarget | undefined,
     outcome: string | undefined,
   ): Promise<void> {
-    const exitResult = await this.executeOperations(context, step, (step as any).onExit ?? [], {
+    const exitResult = await this.executeOperations(context, step, step.onExit ?? [], {
       phase: "on_exit",
       pendingTarget: target,
       parentOutcome: outcome,
@@ -1459,11 +1570,11 @@ class Runtime {
     };
   }
 
-  private async executeHandoff(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
+  private async executeHandoff(context: TurnContext, step: StepDefinition, operation: RuntimeHandoffOperation): Promise<StepRunResult> {
     const handoffId = this.newId("newHandoffId", "handoff");
     const patches: VariablePatch[] = [];
     const saveId = operation.saveHandoffIdToVariableId ?? operation.handoffIdVariableId;
-    if (saveId) patches.push({ type: "set", variableId: saveId, value: handoffId, source: "operation", metadata: { operationId: operation.operationId } } as any);
+    if (saveId) patches.push({ type: "set", variableId: saveId, value: handoffId, source: "operation", metadata: { operationId: operation.operationId } });
     context.events.push(this.event(context, "handoff_started", { operationId: operation.operationId, queueId: operation.queueId ?? operation.queue }));
     context.events.push(this.event(context, "handoff_completed", { operationId: operation.operationId, handoffId, outcome: "handoff_started" }));
     const rendered = operation.message ? await this.renderOne(context, step, operation.message) : emptyRendered();
@@ -1479,7 +1590,7 @@ class Runtime {
     };
   }
 
-  private matchResultBranch(branches: any[], result: any): StepBranch | undefined {
+  private matchResultBranch(branches: ResultBranch[], result: BranchMatchResult): StepBranch | undefined {
     return branches.find((candidate) => {
       const match = candidate.match;
       return (match.type === "outcome" && match.outcome === result.outcome)
@@ -1493,14 +1604,13 @@ class Runtime {
     for (const [outputKey, variableId] of Object.entries(outputMapping)) {
       const error = this.ensureVariable(context.flow, variableId);
       if (error) return { patches, error };
-      patches.push({ type: "set", variableId, value: outputs[outputKey], source, metadata: { operationId } } as any);
+      patches.push({ type: "set", variableId, value: outputs[outputKey], source, metadata: { operationId } });
     }
     return { patches };
   }
 
   private resolveRoute(step: StepDefinition, outcome: string): StepBranch | undefined {
-    const routes = ((step as any).routes ?? []) as Array<Record<string, any>>;
-    return routes
+    return (step.routes ?? [])
       .sort((left, right) => (left.priority ?? 0) - (right.priority ?? 0))
       .find((route) => route.match?.type === "outcome" ? route.match.outcome === outcome : route.match?.type === "always")
       ?.branch;
@@ -1537,39 +1647,39 @@ class Runtime {
     for (const message of result.messages ?? []) context.messages.push(message);
     for (const event of result.events ?? []) context.events.push(event);
     for (const fragment of result.fragments ?? []) context.fragments.push(fragment);
-    for (const patch of result.patches ?? []) this.applyPatch(context, patch as any);
+    for (const patch of result.patches ?? []) this.applyPatch(context, patch);
   }
 
   private applyPatch(context: TurnContext, patch: VariablePatch): void {
-    const variableId = (patch as any).variableId;
-    const scope = this.variableScope(context.flow, variableId, (patch as any).scope);
+    const variableId = patch.variableId;
+    const scope = this.variableScope(context.flow, variableId, patch.scope);
     const previousVariable = this.readScopedVariable(context.state, variableId, scope);
     const previous = previousVariable?.value;
-    const operationId = (patch as any).metadata?.operationId;
-    if ((patch as any).type === "set") {
+    const operationId = typeof patch.metadata?.operationId === "string" ? patch.metadata.operationId : undefined;
+    if (patch.type === "set") {
       const nextVariable = {
         variableId,
         scope,
-        value: (patch as any).value,
-        source: (patch as any).source,
+        value: patch.value,
+        source: patch.source,
         updatedAt: this.clock.now(),
-        metadata: (patch as any).metadata,
+        metadata: patch.metadata,
       };
       this.writeScopedVariable(context.state, variableId, scope, nextVariable);
       context.events.push(this.event(context, "variable_set", { variableId, scope }));
     }
-    if ((patch as any).type === "unset") {
+    if (patch.type === "unset") {
       this.deleteScopedVariable(context.state, variableId, scope);
       context.events.push(this.event(context, "variable_unset", { variableId, scope }));
     }
-    if ((patch as any).type === "invalidate") {
+    if (patch.type === "invalidate") {
       const nextVariable = {
         variableId,
         scope,
         value: previousVariable?.value,
-        source: (patch as any).source,
+        source: patch.source,
         updatedAt: this.clock.now(),
-        metadata: { ...((patch as any).metadata ?? {}), invalidated: true },
+        metadata: { ...(patch.metadata ?? {}), invalidated: true },
       };
       this.writeScopedVariable(context.state, variableId, scope, nextVariable);
       context.events.push(this.event(context, "variable_invalidated", { variableId, scope }));
@@ -1579,22 +1689,22 @@ class Runtime {
       variableId,
       scope,
       previousValue: previous,
-      nextValue: (patch as any).type === "set" ? (patch as any).value : undefined,
-      patchType: (patch as any).type,
-      source: (patch as any).source,
+      nextValue: patch.type === "set" ? patch.value : undefined,
+      patchType: patch.type,
+      source: patch.source,
       conversationId: context.conversation.conversationId,
       flowVersionId: context.flow.flowVersionId,
       stepId: context.state.currentStepId,
       turnId: context.turn.turnId,
       operationId,
       changedAt: this.clock.now(),
-      metadata: (patch as any).metadata,
+      metadata: patch.metadata,
     };
     context.state.variableHistory[variableId] = [...(context.state.variableHistory[variableId] ?? []), entry];
-    context.fragments.push({ source: "variable:write", data: { variableId, scope, patchType: (patch as any).type, operationId } });
+    context.fragments.push({ source: "variable:write", data: { variableId, scope, patchType: patch.type, operationId } });
   }
 
-  private async renderMany(context: TurnContext, step: StepDefinition, plans: any[]) {
+  private async renderMany(context: TurnContext, step: StepDefinition, plans: ResponsePlan[]): Promise<RenderedOutput> {
     const aggregate = emptyRendered();
     for (const plan of plans) {
       const rendered = await this.renderOne(context, step, plan);
@@ -1605,9 +1715,9 @@ class Runtime {
     return aggregate;
   }
 
-  private async renderOne(context: TurnContext, step: StepDefinition, plan: any): Promise<{ messages: OutboundMessage[]; events: ConversationEvent[]; fragments: Array<Record<string, unknown>> }> {
+  private async renderOne(context: TurnContext, step: StepDefinition, plan: ResponsePlan): Promise<RenderedOutput> {
     if (plan?.mode === "reference") {
-      const response = (context.flow.definition.responses ?? []).find((candidate: any) => candidate.responseId === plan.responseId) as any;
+      const response = (context.flow.definition.responses ?? []).find((candidate) => candidate.responseId === plan.responseId);
       if (!response) {
         this.attachError(context, "RESPONSE_NOT_FOUND", `Response ${plan.responseId} was not found.`, false);
         return emptyRendered();
@@ -1623,15 +1733,15 @@ class Runtime {
       context.events.push(this.event(context, "llm_response_generation_started", { stepId: step.stepId }));
       try {
         const filteredContext = { ...this.responseContext(context, step), state: this.filterStateForGeneratedResponse(context.state, plan.allowedVariableIds ?? []) };
-        const generated = await generator.generate(plan, filteredContext as any);
+        const generated = await generator.generate(plan, filteredContext);
         const allowedVariableIds = new Set<string>((plan.allowedVariableIds ?? []).map(String));
-        if (typeof generated === "string" || !Array.isArray((generated as any).usedVariableIds)) {
+        if (!isLlmGeneratedResponse(generated)) {
           context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "LLM_RESPONSE_USAGE_NOT_DECLARED" }));
           context.llmUsage.push({ purpose: "response_generation", success: false });
           this.attachError(context, "LLM_RESPONSE_USAGE_NOT_DECLARED", "Generated response must declare usedVariableIds.", false);
           return emptyRendered();
         }
-        const usedVariableIds = (generated as any).usedVariableIds.map(String);
+        const usedVariableIds = generated.usedVariableIds.map(String);
         const disallowedVariableId = usedVariableIds.find((variableId: string) => !allowedVariableIds.has(variableId));
         if (disallowedVariableId) {
           context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "invalid_generated_response_variable", variableId: disallowedVariableId }));
@@ -1642,7 +1752,7 @@ class Runtime {
           });
           return emptyRendered();
         }
-        const text = typeof generated === "string" ? generated : (generated as any).text;
+        const text = generated.text;
         context.events.push(this.event(context, "llm_response_generation_completed", { stepId: step.stepId }));
         context.llmUsage.push({ purpose: "response_generation", success: true });
         const message = this.textMessage(context, text);
@@ -1677,7 +1787,7 @@ class Runtime {
     };
   }
 
-  private filterStateForGeneratedResponse(state: InternalState, allowedVariableIds: string[]): InternalState {
+  private filterStateForGeneratedResponse(state: InternalState, allowedVariableIds: readonly string[]): InternalState {
     const filtered = clone(state);
     filtered.variables = Object.fromEntries(Object.entries(state.variables).filter(([variableId]) => allowedVariableIds.includes(variableId)));
     filtered.scopedVariables = Object.fromEntries(Object.entries(state.scopedVariables).filter(([, variable]) => allowedVariableIds.includes(variable.variableId)));
@@ -1695,22 +1805,37 @@ class Runtime {
     };
   }
 
-  private evaluateCondition(context: TurnContext, condition: any): boolean {
+  private evaluateCondition(context: TurnContext, condition: ConditionExpression): boolean {
     if (!condition || typeof condition !== "object") return false;
-    if (condition.type === "equals") return this.resolveValue(context, condition.left) === this.resolveValue(context, condition.right);
-    if (condition.type === "not_equals") return this.resolveValue(context, condition.left) !== this.resolveValue(context, condition.right);
-    if (condition.type === "exists") return condition.variableId in context.state.variables;
-    if (condition.type === "not_exists") return !(condition.variableId in context.state.variables);
-    if (condition.type === "greater_than") return Number(this.resolveValue(context, condition.left)) > Number(this.resolveValue(context, condition.right));
-    if (condition.type === "less_than") return Number(this.resolveValue(context, condition.left)) < Number(this.resolveValue(context, condition.right));
-    if (condition.type === "matches_regex") return new RegExp(condition.pattern, condition.flags).test(String(this.resolveValue(context, condition.value)));
-    if (condition.type === "and") return (condition.conditions ?? []).every((item: any) => this.evaluateCondition(context, item));
-    if (condition.type === "or") return (condition.conditions ?? []).some((item: any) => this.evaluateCondition(context, item));
-    if (condition.type === "not") return !this.evaluateCondition(context, condition.condition);
-    return false;
+    switch (condition.type) {
+      case "equals":
+        return this.resolveValue(context, condition.left) === this.resolveValue(context, condition.right);
+      case "not_equals":
+        return this.resolveValue(context, condition.left) !== this.resolveValue(context, condition.right);
+      case "exists":
+        return condition.variableId in context.state.variables;
+      case "not_exists":
+        return !(condition.variableId in context.state.variables);
+      case "greater_than":
+        return Number(this.resolveValue(context, condition.left)) > Number(this.resolveValue(context, condition.right));
+      case "less_than":
+        return Number(this.resolveValue(context, condition.left)) < Number(this.resolveValue(context, condition.right));
+      case "includes": {
+        const collection = this.resolveValue(context, condition.collection);
+        return Array.isArray(collection) && collection.includes(this.resolveValue(context, condition.value));
+      }
+      case "matches_regex":
+        return new RegExp(condition.pattern, condition.flags).test(String(this.resolveValue(context, condition.value)));
+      case "and":
+        return condition.conditions.every((item) => this.evaluateCondition(context, item));
+      case "or":
+        return condition.conditions.some((item) => this.evaluateCondition(context, item));
+      case "not":
+        return !this.evaluateCondition(context, condition.condition);
+    }
   }
 
-  private resolveValue(context: TurnContext, expression: any): unknown {
+  private resolveValue(context: TurnContext, expression: ValueExpression): unknown {
     if (!expression || typeof expression !== "object") return expression;
     if (expression.type === "literal") return expression.value;
     if (expression.type === "variable") {
@@ -1735,12 +1860,12 @@ class Runtime {
     return undefined;
   }
 
-  private resolveMapping(context: TurnContext, mapping: Record<string, any>): Record<string, unknown> {
+  private resolveMapping(context: TurnContext, mapping: Record<string, ValueExpression>): Record<string, unknown> {
     return Object.fromEntries(Object.entries(mapping).map(([key, expression]) => [key, this.resolveValue(context, expression)]));
   }
 
   private ensureVariable(flow: FlowVersion, variableId: string): RuntimeError | undefined {
-    return (flow.definition.variables ?? []).some((variable: any) => variable.variableId === variableId)
+    return (flow.definition.variables ?? []).some((variable) => variable.variableId === variableId)
       ? undefined
       : this.missingVariableError(flow, variableId);
   }
@@ -1755,7 +1880,7 @@ class Runtime {
   }
 
   private variableScope(flow: FlowVersion, variableId: string, explicit?: VariableScope): VariableScope {
-    return explicit ?? ((flow.definition.variables ?? []).find((variable: any) => variable.variableId === variableId)?.scope ?? "conversation");
+    return explicit ?? ((flow.definition.variables ?? []).find((variable) => variable.variableId === variableId)?.scope ?? "conversation");
   }
 
   private scopedKey(scope: VariableScope, variableId: string): string {
@@ -1770,7 +1895,7 @@ class Runtime {
     state: InternalState,
     variableId: string,
     scope: VariableScope,
-    value: { variableId: string; scope?: VariableScope; value?: unknown; source?: string; updatedAt?: string; metadata?: Record<string, unknown> },
+    value: RuntimeVariableValue,
   ): void {
     const scopedValue = { ...value, scope };
     state.scopedVariables[this.scopedKey(scope, variableId)] = scopedValue;
@@ -1796,7 +1921,7 @@ class Runtime {
   }
 
   private getStep(flow: FlowVersion, stepId: string): StepDefinition | undefined {
-    return (flow.definition.steps ?? []).find((step: any) => step.stepId === stepId) as StepDefinition | undefined;
+    return (flow.definition.steps ?? []).find((step) => step.stepId === stepId);
   }
 
   private createConversation(request: { conversationId: string; flowVersionId: string; channel?: string; userId?: string; metadata?: Record<string, unknown> }, flow?: FlowVersion): Conversation {
@@ -1809,11 +1934,11 @@ class Runtime {
       createdAt: this.clock.now(),
       updatedAt: this.clock.now(),
       metadata: request.metadata,
-    } as Conversation;
+    };
   }
 
-  private createInitialState(conversation: Conversation, flow?: FlowVersion, initialVariables: Record<string, unknown> = {}): InternalState {
-    const state: InternalState = {
+  private createInitialState(conversation: Conversation, flow?: FlowVersion): InternalState {
+    return {
       conversationId: conversation.conversationId,
       flowVersionId: conversation.flowVersionId,
       status: flow ? "active" : "failed",
@@ -1824,24 +1949,23 @@ class Runtime {
       executionStack: [],
       version: 0,
       updatedAt: this.clock.now(),
-    } as InternalState;
-    return state;
+    };
   }
 
   private applyInitialVariables(context: TurnContext, initialVariables: Record<string, unknown>): void {
     for (const variable of context.flow.definition.variables ?? []) {
-      const typed = variable as any;
-      if ("defaultValue" in typed) this.applyPatch(context, { type: "set", variableId: typed.variableId, value: typed.defaultValue, source: "system", scope: typed.scope } as any);
+      if ("defaultValue" in variable) this.applyPatch(context, { type: "set", variableId: variable.variableId, value: variable.defaultValue, source: "system", scope: variable.scope });
     }
     for (const [variableId, value] of Object.entries(initialVariables)) {
-      if (value && typeof value === "object" && !Array.isArray(value) && ["conversation", "flow", "operation", "system"].some((scope) => scope in (value as any))) {
-        for (const [scope, scopedValues] of Object.entries(value as Record<string, Record<string, unknown>>)) {
+      if (isScopedInitialVariables(value)) {
+        for (const [scope, scopedValues] of Object.entries(value)) {
+          if (!isVariableScope(scope)) continue;
           for (const [scopedVariableId, scopedValue] of Object.entries(scopedValues)) {
-            this.applyPatch(context, { type: "set", variableId: scopedVariableId, value: scopedValue, source: "system", scope } as any);
+            this.applyPatch(context, { type: "set", variableId: scopedVariableId, value: scopedValue, source: "system", scope });
           }
         }
       } else {
-        this.applyPatch(context, { type: "set", variableId, value, source: "system" } as any);
+        this.applyPatch(context, { type: "set", variableId, value, source: "system" });
       }
     }
   }
@@ -1858,7 +1982,7 @@ class Runtime {
 
   private createContext(flow: FlowVersion | undefined, conversation: Conversation, state: InternalState, turn: Turn, userInput?: UserInput): TurnContext {
     return {
-      flow: flow ?? ({ flowVersionId: conversation.flowVersionId, flowId: "unknown", definition: { startStepId: state.currentStepId, steps: [], variables: [] } } as any),
+      flow: flow ?? this.createFallbackFlow(conversation.flowVersionId, state.currentStepId),
       conversation,
       state,
       turn: { ...turn, userInput },
@@ -1881,18 +2005,18 @@ class Runtime {
     context.state.lastOutboundMessages = context.messages;
     const trace = this.trace(context);
     await this.repositories.conversations.save(clone(context.conversation));
-    await this.repositories.states.save(clone(context.state) as any);
+    await this.repositories.states.save(clone(context.state));
     await this.repositories.events.append(clone(context.events));
     await this.repositories.traces.save(clone(trace));
     return {
       conversation: clone(context.conversation),
-      state: clone(context.state) as any,
+      state: clone(context.state),
       turn: clone(context.turn),
       events: clone(context.events),
       messages: clone(context.messages),
       trace: clone(trace),
       ...(context.error ? { error: context.error } : {}),
-    } as ProcessTurnResult;
+    };
   }
 
   private fail(context: TurnContext, code: string, message: string, recoverable: boolean): Promise<ProcessTurnResult> {
@@ -1928,11 +2052,11 @@ class Runtime {
     return { code, message, recoverable, ...details } as RuntimeError;
   }
 
-  private event(context: TurnContext, type: string, payload: Record<string, unknown> = {}): ConversationEvent {
+  private event(context: TurnContext, type: ConversationEventType, payload: Record<string, unknown> = {}): ConversationEvent {
     return this.eventBase(context.conversation, context.turn, type, payload, context.state.currentStepId);
   }
 
-  private eventBase(conversation: Conversation, turn: Turn, type: string, payload: Record<string, unknown>, stepId?: string): ConversationEvent {
+  private eventBase(conversation: Conversation, turn: Turn, type: ConversationEventType, payload: Record<string, unknown>, stepId?: string): ConversationEvent {
     return {
       eventId: this.newId("newEventId", "event"),
       conversationId: conversation.conversationId,
@@ -1940,7 +2064,7 @@ class Runtime {
       flowVersionId: conversation.flowVersionId,
       stepId,
       type,
-      payload: payload as any,
+      payload,
       createdAt: this.clock.now(),
     };
   }
@@ -1954,58 +2078,116 @@ class Runtime {
       initialStepId: context.initialStepId,
       finalStepId: context.state.currentStepId,
       userInput: context.turn.userInput,
-      fragments: context.fragments as any,
+      fragments: context.fragments,
       events: context.events,
       messages: context.messages,
       variablePatches: context.patches,
-      llmUsage: context.llmUsage as any,
+      llmUsage: context.llmUsage,
       createdAt: this.clock.now(),
     };
   }
 
-  private appendEvents(events: ConversationEvent[]): void {
-    for (const event of events) {
-      const list = this.events.get(event.conversationId) ?? [];
-      list.push(clone(event));
-      this.events.set(event.conversationId, list);
-    }
-  }
-
-  private appendTrace(trace: DecisionTrace): void {
-    const list = this.traces.get(trace.conversationId) ?? [];
-    list.push(clone(trace));
-    this.traces.set(trace.conversationId, list);
-  }
-
-  private newId(method: string, prefix: string): string {
+  private newId(method: IdFactoryName, prefix: string): string {
     return this.idGenerator[method]?.() ?? `${prefix}-${Math.random().toString(36).slice(2)}`;
   }
 
-  private stepContext(context: TurnContext, step: StepDefinition) {
-    return { flow: context.flow, step, config: (step as any).config, state: context.state, turn: context.turn, services: this.services() };
+  private stepContext(context: TurnContext, step: StepDefinition): StepExecutionContext {
+    return { flow: context.flow, step, config: step.config, state: context.state, turn: context.turn, services: this.services() };
   }
 
-  private inputContext(context: TurnContext, step: StepDefinition) {
+  private inputContext(context: TurnContext, step: StepDefinition): InputProcessingContext {
     return { flow: context.flow, step, state: context.state, turn: context.turn };
   }
 
-  private responseContext(context: TurnContext, step: StepDefinition) {
+  private responseContext(context: TurnContext, step: StepDefinition): ResponseRenderingContext {
     return { flow: context.flow, step, state: context.state, turn: context.turn, channel: context.conversation.channel };
   }
 
-  private operationContext(context: TurnContext, step: StepDefinition) {
+  private operationContext(context: TurnContext, step: StepDefinition): OperationExecutionContext {
     return { flow: context.flow, step, state: context.state, turn: context.turn, services: this.services() };
   }
 
-  private actionContext(context: TurnContext, step: StepDefinition) {
+  private actionContext(context: TurnContext, step: StepDefinition): ActionExecutionContext {
     return { flow: context.flow, step, state: context.state, turn: context.turn };
   }
 
-  private async callSemanticResolver(resolver: NonNullable<EngineOptions["semanticInputResolver"]>, input: UserInput, task: unknown, context: unknown): Promise<unknown> {
-    return typeof resolver === "function" ? resolver(input, task as any, context as any) : resolver.resolve(input, task as any, context as any);
+  private conditionEvaluationContext(context: Parameters<RuntimeServices["conditionEvaluator"]["evaluate"]>[1]): TurnContext {
+    const conversation: Conversation = {
+      conversationId: context.state.conversationId,
+      flowVersionId: context.state.flowVersionId,
+      status: context.state.status,
+      createdAt: context.state.updatedAt,
+      updatedAt: context.state.updatedAt,
+    };
+    return {
+      flow: context.flow,
+      conversation,
+      state: this.toInternalState(context.state),
+      turn: context.turn ?? this.createTurn(context.state.conversationId),
+      messages: [],
+      events: [],
+      fragments: [],
+      patches: [],
+      llmUsage: [],
+      initialStepId: context.step.stepId,
+    };
   }
 
-  private normalizeExternalStepResult(result: any): StepRunResult {
+  private stepPrompt(step: StepDefinition): ResponsePlan | undefined {
+    if (step.type === "menu" || step.type === "input" || step.type === "attachment") {
+      return step.config.prompt;
+    }
+    return undefined;
+  }
+
+  private isFlowCallFrame(frame: FlowExecutionFrame | undefined): frame is FlowCallExecutionFrame {
+    return frame?.metadata?.kind === "flow_call";
+  }
+
+  private createFallbackFlow(flowVersionId: string, currentStepId: string): FlowVersion {
+    return {
+      flowVersionId,
+      flowId: "unknown",
+      version: "unknown",
+      status: "draft",
+      schemaVersion: "unknown",
+      createdAt: this.clock.now(),
+      definition: {
+        flowId: "unknown",
+        startStepId: currentStepId,
+        variables: [],
+        steps: [],
+      },
+    };
+  }
+
+  private toInternalState(state: ConversationState): InternalState {
+    return {
+      ...state,
+      variables: clone(state.variables),
+      scopedVariables: clone(state.scopedVariables ?? this.scopedVariablesFromFlatValues(state.variables)),
+      variableHistory: clone(state.variableHistory ?? {}),
+    };
+  }
+
+  private scopedVariablesFromFlatValues(variables: ConversationState["variables"]): InternalState["scopedVariables"] {
+    const scopedVariables: InternalState["scopedVariables"] = {};
+    for (const variable of Object.values(variables)) {
+      scopedVariables[this.scopedKey(variable.scope, variable.variableId)] = clone(variable);
+    }
+    return scopedVariables;
+  }
+
+  private async callSemanticResolver(
+    resolver: NonNullable<EngineOptions["semanticInputResolver"]>,
+    input: UserInput,
+    task: SemanticInputTask,
+    context: InputProcessingContext,
+  ): Promise<SemanticInputResolution> {
+    return typeof resolver === "function" ? resolver(input, task, context) : resolver.resolve(input, task, context);
+  }
+
+  private normalizeExternalStepResult(result: StepResult): StepRunResult {
     return {
       status: result.status,
       outcome: result.outcome,
@@ -2020,11 +2202,27 @@ class Runtime {
   }
 }
 
-function emptyRendered(): { messages: OutboundMessage[]; events: ConversationEvent[]; fragments: Array<Record<string, unknown>> } {
+function emptyRendered(): RenderedOutput {
   return { messages: [], events: [], fragments: [] };
 }
 
 function clone<T>(value: T): T {
   if (value === undefined) return value;
   return structuredClone(value) as T;
+}
+
+function isLlmGeneratedResponse(value: LlmGeneratedResponse | unknown): value is LlmGeneratedResponse {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { text?: unknown; usedVariableIds?: unknown };
+  return typeof candidate.text === "string" && Array.isArray(candidate.usedVariableIds);
+}
+
+function isScopedInitialVariables(value: unknown): value is Partial<Record<VariableScope, Record<VariableId, unknown>>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<Record<VariableScope, unknown>>;
+  return ["conversation", "flow", "operation", "system"].some((scope) => scope in candidate);
+}
+
+function isVariableScope(value: string): value is VariableScope {
+  return value === "conversation" || value === "flow" || value === "operation" || value === "system";
 }
