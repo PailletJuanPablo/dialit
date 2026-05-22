@@ -314,21 +314,21 @@ class Runtime {
 
   private async getFlowVersion(flowVersionId: string): Promise<FlowVersion | undefined> {
     if (this.repositories.flowVersions !== this.internalRepositories.flowVersions) {
-      return await this.repositories.flowVersions.getById(flowVersionId) ?? this.flowVersions.get(flowVersionId);
+      return this.repositories.flowVersions.getById(flowVersionId);
     }
     return this.flowVersions.get(flowVersionId);
   }
 
   private async getConversation(conversationId: string): Promise<Conversation | undefined> {
     if (this.repositories.conversations !== this.internalRepositories.conversations) {
-      return await this.repositories.conversations.getById(conversationId) ?? this.conversations.get(conversationId);
+      return this.repositories.conversations.getById(conversationId);
     }
     return this.conversations.get(conversationId);
   }
 
   private async getState(conversationId: string): Promise<InternalState | undefined> {
     if (this.repositories.states !== this.internalRepositories.states) {
-      return (await this.repositories.states.getByConversationId(conversationId) ?? this.states.get(conversationId)) as InternalState | undefined;
+      return await this.repositories.states.getByConversationId(conversationId) as InternalState | undefined;
     }
     return this.states.get(conversationId);
   }
@@ -380,6 +380,7 @@ class Runtime {
 
   private async applyStepResult(context: TurnContext, step: StepDefinition, result: StepRunResult): Promise<void> {
     this.collect(context, result);
+    if (context.error) return;
     if (result.status === "waiting_input") {
       context.state.status = "waiting_input";
       context.state.pendingInput = { stepId: step.stepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
@@ -807,7 +808,9 @@ class Runtime {
     if (operation.type === "handoff") return this.executeHandoff(context, step, operation);
     if (operation.type === "custom") return this.executeCustomOperation(context, step, operation);
     if (operation.type === "emit_event") {
-      return { status: "completed", events: [this.event(context, operation.eventType, this.resolveMapping(context, operation.payload ?? {}))], fragments: [{ source: "operation:emit_event", data: { eventType: operation.eventType } }] };
+      const payload = this.resolveMapping(context, operation.payload ?? {});
+      if (context.error) return { status: "failed", error: context.error };
+      return { status: "completed", events: [this.event(context, operation.eventType, payload)], fragments: [{ source: "operation:emit_event", data: { eventType: operation.eventType } }] };
     }
     return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operation.type} is not registered.`, false) };
   }
@@ -816,6 +819,7 @@ class Runtime {
     const action = (context.flow.definition.actions ?? []).find((candidate: any) => candidate.actionId === operation.actionId) as any;
     if (!action) return { status: "failed", error: this.runtimeError("ACTION_NOT_FOUND", `Action ${operation.actionId} was not found.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
+    if (context.error) return { status: "failed", error: context.error };
     context.events.push(this.event(context, "action_started", { actionId: action.actionId, actionKind: action.kind }));
     const handler = this.options.actionHandlers?.[action.kind];
     if (!handler && !this.options.services?.actionExecutor) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
@@ -849,6 +853,7 @@ class Runtime {
     const contract = this.options.customOperations?.[operation.customType];
     if (!contract) return { status: "failed", error: this.runtimeError("CUSTOM_OPERATION_CONTRACT_NOT_REGISTERED", `Custom operation ${operation.customType} is not registered.`, false) };
     const input = this.resolveMapping(context, operation.inputMapping ?? {});
+    if (context.error) return { status: "failed", error: context.error };
     const result = await contract.execute(operation, input, this.operationContext(context, step)) as any;
     const outcome = result.outcome ?? result.status;
     if (contract.outcomes && outcome && !contract.outcomes.includes(outcome)) {
@@ -876,22 +881,16 @@ class Runtime {
   private async executeFlowCall(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
     const childFlow = await this.getFlowVersion(operation.flowVersionId);
     if (!childFlow) return { status: "failed", error: this.runtimeError("FLOW_VERSION_NOT_FOUND", `Flow version ${operation.flowVersionId} was not found.`, false) };
-    const isolatedVariables = (childFlow.definition.variables ?? []).filter((variable: any) => (variable.scope ?? "conversation") === "flow").map((variable: any) => variable.variableId);
+    const beforeScopedVariables = clone(context.state.scopedVariables);
+    const sharing = this.flowCallSharingPolicy(operation);
     const childContext: TurnContext = { ...context, flow: childFlow, nested: true, initialStepId: childFlow.definition.startStepId };
     childContext.state.currentStepId = childFlow.definition.startStepId;
     childContext.state.status = "active";
-    const parentScopedSnapshot = new Map<string, any>();
-    for (const variableId of isolatedVariables) {
-      parentScopedSnapshot.set(variableId, clone(context.state.scopedVariables[this.scopedKey("conversation", variableId)]));
-    }
     context.events.push(this.event(context, "flow_call_started", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId }));
     await this.runAutomaticSteps(childContext);
-    for (const variableId of isolatedVariables) {
-      this.deleteScopedVariable(context.state, variableId, "flow");
-      const parentValue = parentScopedSnapshot.get(variableId);
-      if (parentValue) this.writeScopedVariable(context.state, variableId, "conversation", parentValue);
-      else if (this.variableScope(context.flow, variableId) !== "conversation") delete context.state.variables[variableId];
-    }
+    const afterScopedVariables = clone(context.state.scopedVariables);
+    const sharingResult = this.restoreFlowCallVariables(context.state, beforeScopedVariables, afterScopedVariables, sharing);
+    if (childContext.error) return { status: "failed", error: childContext.error };
     context.state.status = "active";
     context.events.push(this.event(context, "flow_call_completed", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, status: "completed" }));
     const result = { status: "completed", outcome: "completed" };
@@ -905,11 +904,66 @@ class Runtime {
         data: {
           operationId: operation.operationId,
           flowVersionId: childFlow.flowVersionId,
-          sharedVariables: operation.sharedVariableIds ?? Object.keys(context.state.variables),
-          isolatedVariables,
+          sharedVariables: sharingResult.sharedVariables,
+          isolatedVariables: sharingResult.isolatedVariables,
         },
       }],
     };
+  }
+
+  private flowCallSharingPolicy(operation: any): { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> } {
+    const sharing = operation.variableSharing;
+    const includeValues = sharing?.includeVariableIds ?? operation.sharedVariableIds;
+    return {
+      scopes: new Set((sharing?.scopes ?? ["conversation"]) as VariableScope[]),
+      include: includeValues ? new Set(includeValues.map(String)) : undefined,
+      exclude: new Set((sharing?.excludeVariableIds ?? []).map(String)),
+    };
+  }
+
+  private restoreFlowCallVariables(
+    state: InternalState,
+    beforeScopedVariables: InternalState["scopedVariables"],
+    afterScopedVariables: InternalState["scopedVariables"],
+    sharing: { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> },
+  ): { sharedVariables: string[]; isolatedVariables: string[] } {
+    const sharedVariables = new Set<string>();
+    const isolatedVariables = new Set<string>();
+    state.scopedVariables = {};
+    state.variables = {};
+
+    for (const variable of Object.values(beforeScopedVariables)) {
+      const scope = variable.scope ?? "conversation";
+      if (!this.canShareFlowCallVariable(variable.variableId, scope, sharing)) {
+        this.writeScopedVariable(state, variable.variableId, scope, clone(variable));
+      }
+    }
+
+    for (const variable of Object.values(afterScopedVariables)) {
+      const scope = variable.scope ?? "conversation";
+      if (this.canShareFlowCallVariable(variable.variableId, scope, sharing)) {
+        this.writeScopedVariable(state, variable.variableId, scope, clone(variable));
+        sharedVariables.add(variable.variableId);
+      } else {
+        isolatedVariables.add(variable.variableId);
+      }
+    }
+
+    return {
+      sharedVariables: [...sharedVariables].sort(),
+      isolatedVariables: [...isolatedVariables].sort(),
+    };
+  }
+
+  private canShareFlowCallVariable(
+    variableId: string,
+    scope: VariableScope,
+    sharing: { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> },
+  ): boolean {
+    if (!sharing.scopes.has(scope)) return false;
+    if (sharing.exclude.has(variableId)) return false;
+    if (sharing.include && !sharing.include.has(variableId)) return false;
+    return true;
   }
 
   private async executeHandoff(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {
@@ -1077,6 +1131,18 @@ class Runtime {
       try {
         const filteredContext = { ...this.responseContext(context, step), state: this.filterStateForGeneratedResponse(context.state, plan.allowedVariableIds ?? []) };
         const generated = await generator.generate(plan, filteredContext as any);
+        const allowedVariableIds = new Set<string>((plan.allowedVariableIds ?? []).map(String));
+        const usedVariableIds = typeof generated === "string" ? [] : ((generated as any).usedVariableIds ?? []).map(String);
+        const disallowedVariableId = usedVariableIds.find((variableId: string) => !allowedVariableIds.has(variableId));
+        if (disallowedVariableId) {
+          context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "invalid_generated_response_variable", variableId: disallowedVariableId }));
+          context.llmUsage.push({ purpose: "response_generation", success: false });
+          this.attachError(context, "invalid_generated_response_variable", `Generated response used undeclared variable ${disallowedVariableId}.`, false, {
+            variableId: disallowedVariableId,
+            allowedVariableIds: [...allowedVariableIds],
+          });
+          return emptyRendered();
+        }
         const text = typeof generated === "string" ? generated : (generated as any).text;
         context.events.push(this.event(context, "llm_response_generation_completed", { stepId: step.stepId }));
         context.llmUsage.push({ purpose: "response_generation", success: true });
@@ -1315,22 +1381,10 @@ class Runtime {
     context.state.version += 1;
     context.state.lastOutboundMessages = context.messages;
     const trace = this.trace(context);
-    await this.internalRepositories.conversations.save(context.conversation);
-    await this.internalRepositories.states.save(context.state as any);
-    await this.internalRepositories.events.append(context.events);
-    await this.internalRepositories.traces.save(trace);
-    if (this.repositories.conversations !== this.internalRepositories.conversations) {
-      await this.repositories.conversations.save(clone(context.conversation));
-    }
-    if (this.repositories.states !== this.internalRepositories.states) {
-      await this.repositories.states.save(clone(context.state) as any);
-    }
-    if (this.repositories.events !== this.internalRepositories.events) {
-      await this.repositories.events.append(clone(context.events));
-    }
-    if (this.repositories.traces !== this.internalRepositories.traces) {
-      await this.repositories.traces.save(clone(trace));
-    }
+    await this.repositories.conversations.save(clone(context.conversation));
+    await this.repositories.states.save(clone(context.state) as any);
+    await this.repositories.events.append(clone(context.events));
+    await this.repositories.traces.save(clone(trace));
     return {
       conversation: clone(context.conversation),
       state: clone(context.state) as any,
@@ -1363,6 +1417,10 @@ class Runtime {
   private attachRuntimeError(context: TurnContext, error: RuntimeError): void {
     const { code, message, recoverable, ...details } = error as RuntimeError & Record<string, unknown>;
     context.error = error;
+    if (!recoverable) {
+      context.state.status = "failed";
+      context.conversation.status = "failed";
+    }
     context.events.push(this.event(context, "error_raised", { code, message, ...details }));
     context.fragments.push({ source: "error", data: { code, message, recoverable, ...details } });
   }

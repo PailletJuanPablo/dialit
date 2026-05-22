@@ -579,6 +579,7 @@ describe("Nexembot v0.1 no-silent-fallback guarantees", () => {
     let result = await runtime.startConversation({
       conversationId: `conversation-${code.toLowerCase()}`,
       flowVersionId: flowVersion.flowVersionId,
+      initialVariables: code === "ACTION_HANDLER_NOT_REGISTERED" ? { dni: "12345678" } : undefined,
     });
 
     if (code === "SEMANTIC_INPUT_RESOLVER_NOT_REGISTERED") {
@@ -762,6 +763,106 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     expect(result.error).toMatchObject({
       variableId: "unknownOutput",
       scope: "conversation",
+    });
+  });
+
+  it("does not fall back to private state when persistence repositories are injected", async () => {
+    const runtime = engineWith(menuPolicyFlow(), {
+      repositories: {
+        conversations: {
+          getById: async () => undefined,
+          save: async () => undefined,
+        },
+        states: {
+          getByConversationId: async () => undefined,
+          save: async () => undefined,
+        },
+      },
+    });
+
+    await runtime.startConversation({
+      conversationId: "conversation-broken-persistence",
+      flowVersionId: "menu-policy-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-broken-persistence",
+      input: textInput("conversation-broken-persistence", "Billing"),
+    });
+
+    expectStructuredFailure(result, "CONVERSATION_NOT_FOUND");
+  });
+
+  it("does not execute actions when input mapping references a missing variable", async () => {
+    const actionHandler = vi.fn(async () => ({
+      status: "success",
+      outcome: "found",
+      outputs: { customerStatus: "found" },
+    }));
+    const runtime = engineWith(actionFlow(), {
+      actionHandlers: { local: actionHandler },
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-action-missing-input",
+      flowVersionId: "action-v1",
+    });
+
+    expect(actionHandler).not.toHaveBeenCalled();
+    expectStructuredFailure(result, "missing_variable_reference");
+    expect(result.error).toMatchObject({
+      variableId: "dni",
+      scope: "conversation",
+    });
+    expect(result.state.status).toBe("failed");
+  });
+
+  it("keeps excluded variables isolated during flow calls", async () => {
+    const runtime = engineWith(variableSharingParentFlow(), {
+      flowVersions: [variableSharingChildFlow()],
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-variable-sharing",
+      flowVersionId: "variable-sharing-parent-v1",
+      initialVariables: { secret: "parent-secret" },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "secret")).toBe("parent-secret");
+    expect(texts(result)).toContain("Secret is parent-secret.");
+    expect(result.trace.fragments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "operation:call_flow",
+          data: expect.objectContaining({
+            sharedVariables: [],
+            isolatedVariables: expect.arrayContaining(["secret"]),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("rejects generated responses that report disallowed variable usage", async () => {
+    const runtime = engineWith(generatedResponseFlow(), {
+      llmResponseGenerator: async () => ({
+        text: "Leaked private note.",
+        usedVariableIds: ["privateNote"],
+      }),
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-generated-contract-violation",
+      flowVersionId: "generated-v1",
+      initialVariables: { ticketId: "123", privateNote: "secret" },
+    });
+
+    expect(texts(result)).toEqual([]);
+    expectStructuredFailure(result, "invalid_generated_response_variable");
+    expect(result.error).toMatchObject({
+      variableId: "privateNote",
+      allowedVariableIds: ["ticketId"],
     });
   });
 
@@ -1727,6 +1828,52 @@ function actionOutputMissingVariableFlow(): FlowVersion {
             outputMapping: { customerStatus: "unknownOutput" },
           },
         ],
+      }),
+    ],
+  });
+}
+
+function variableSharingParentFlow(): FlowVersion {
+  return flowVersion("variable-sharing-parent-v1", {
+    flowId: "variable-sharing-parent",
+    startStepId: "call_child",
+    variables: [variable("secret", "string", "conversation")],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "call_flow",
+            operationId: "call_variable_sharing_child",
+            flowVersionId: "variable-sharing-child-v1",
+            variableSharing: {
+              scopes: ["conversation"],
+              excludeVariableIds: ["secret"],
+            },
+            onResult: [
+              {
+                match: { type: "outcome", outcome: "completed" },
+                branch: branch({ target: stepTarget("done") }),
+              },
+            ],
+          },
+        ],
+      }),
+      messageStep("done", [{ mode: "template", template: "Secret is {{secret}}.", variableIds: ["secret"] }]),
+    ],
+  });
+}
+
+function variableSharingChildFlow(): FlowVersion {
+  return flowVersion("variable-sharing-child-v1", {
+    flowId: "variable-sharing-child",
+    startStepId: "write_secret",
+    variables: [variable("secret", "string", "conversation")],
+    steps: [
+      messageStep("write_secret", [], {
+        autoAdvance: true,
+        onEnter: [setVariable("secret", "child-secret", "flow_call")],
+        routes: [route("next", branch({ target: endTarget("completed") }))],
       }),
     ],
   });
