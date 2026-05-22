@@ -827,7 +827,9 @@ class Runtime {
       return { status: "failed", error: this.runtimeError("ACTION_RESULT_OUT_OF_CONTRACT", `Action outcome ${outcome} is not declared.`, false) };
     }
     context.events.push(this.event(context, result.status === "success" ? "action_completed" : "action_failed", { actionId: action.actionId, outcome }));
-    const patches = this.outputPatches(context, operation.outputMapping ?? {}, result.outputs ?? {}, "action_result", operation.operationId);
+    const output = this.outputPatches(context, operation.outputMapping ?? {}, result.outputs ?? {}, "action_result", operation.operationId);
+    if (output.error) return { status: "failed", error: output.error };
+    const patches = output.patches;
     const branch = this.matchResultBranch(operation.onResult ?? [], result);
     return {
       status: result.status === "success" || result.outcome ? "completed" : "failed",
@@ -939,14 +941,14 @@ class Runtime {
     })?.branch;
   }
 
-  private outputPatches(context: TurnContext, outputMapping: Record<string, string>, outputs: Record<string, unknown>, source: VariableValueSource, operationId?: string): VariablePatch[] {
+  private outputPatches(context: TurnContext, outputMapping: Record<string, string>, outputs: Record<string, unknown>, source: VariableValueSource, operationId?: string): { patches: VariablePatch[]; error?: RuntimeError } {
     const patches: VariablePatch[] = [];
     for (const [outputKey, variableId] of Object.entries(outputMapping)) {
       const error = this.ensureVariable(context.flow, variableId);
-      if (error) throw new Error(error.message);
+      if (error) return { patches, error };
       patches.push({ type: "set", variableId, value: outputs[outputKey], source, metadata: { operationId } } as any);
     }
-    return patches;
+    return { patches };
   }
 
   private resolveRoute(step: StepDefinition, outcome: string): StepBranch | undefined {

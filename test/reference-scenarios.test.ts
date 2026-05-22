@@ -741,6 +741,30 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     expectStructuredFailure(result, "VALIDATOR_NOT_REGISTERED");
   });
 
+  it("fails structurally when action output mapping targets an unknown variable", async () => {
+    const runtime = engineWith(actionOutputMissingVariableFlow(), {
+      actionHandlers: {
+        local: async () => ({
+          status: "success",
+          outcome: "success",
+          outputs: { customerStatus: "active" },
+        }),
+      },
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-action-output-missing-variable",
+      flowVersionId: "action-output-missing-variable-v1",
+      initialVariables: { dni: "12345678" },
+    });
+
+    expectStructuredFailure(result, "missing_variable_reference");
+    expect(result.error).toMatchObject({
+      variableId: "unknownOutput",
+      scope: "conversation",
+    });
+  });
+
   it("honors injected repositories, config, runtime, and exposes services in custom contexts", async () => {
     const savedConversations: unknown[] = [];
     const appendedEvents: unknown[] = [];
@@ -1674,6 +1698,35 @@ function unknownValidatorFlow(): FlowVersion {
       inputStep("ask", "Value?", "dni", {
         validators: [{ type: "not_registered_validator" }],
         routes: [route("captured", branch({ target: endTarget("completed") }))],
+      }),
+    ],
+  });
+}
+
+function actionOutputMissingVariableFlow(): FlowVersion {
+  return flowVersion("action-output-missing-variable-v1", {
+    flowId: "action-output-missing-variable",
+    startStepId: "lookup",
+    variables: [variable("dni", "string", "conversation")],
+    actions: [
+      {
+        actionId: "lookup_customer",
+        kind: "local",
+        resultOutcomes: ["success"],
+      },
+    ],
+    steps: [
+      messageStep("lookup", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "run_action",
+            operationId: "lookup_customer",
+            actionId: "lookup_customer",
+            inputMapping: { dni: variableRef("dni") },
+            outputMapping: { customerStatus: "unknownOutput" },
+          },
+        ],
       }),
     ],
   });
