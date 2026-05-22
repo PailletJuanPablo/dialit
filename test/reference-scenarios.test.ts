@@ -818,6 +818,46 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     });
   });
 
+  it("executes custom steps from an injected service registry", async () => {
+    const injectedHandler = {
+      stepType: "composition_step",
+      validate: () => [],
+      enter: async (context: unknown) => ({
+        status: "completed",
+        outcome: "done",
+        variablePatches: [
+          {
+            type: "set",
+            variableId: "serviceSeen",
+            value: Boolean((context as { services?: unknown }).services),
+            source: "operation",
+          },
+        ],
+        trace: { source: "custom_step:composition_step" },
+      }),
+    };
+    const runtime = engineWith(compositionFlow(), {
+      services: {
+        stepRegistry: {
+          register: () => undefined,
+          getHandler: (stepType: string) => {
+            if (stepType !== "composition_step") throw new Error(`Unexpected step type ${stepType}`);
+            return injectedHandler;
+          },
+          hasHandler: (stepType: string) => stepType === "composition_step",
+        },
+      },
+    });
+
+    const result = await runtime.startConversation({
+      conversationId: "conversation-injected-service",
+      flowVersionId: "composition-v1",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "serviceSeen")).toBe(true);
+  });
+
   it("returns public structured missing_variable_reference errors with details", async () => {
     const result = await engineWith(missingTemplateVariableFlow()).startConversation({
       conversationId: "conversation-public-error",

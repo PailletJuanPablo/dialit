@@ -313,15 +313,24 @@ class Runtime {
   }
 
   private async getFlowVersion(flowVersionId: string): Promise<FlowVersion | undefined> {
-    return this.flowVersions.get(flowVersionId) ?? await this.repositories.flowVersions.getById(flowVersionId);
+    if (this.repositories.flowVersions !== this.internalRepositories.flowVersions) {
+      return await this.repositories.flowVersions.getById(flowVersionId) ?? this.flowVersions.get(flowVersionId);
+    }
+    return this.flowVersions.get(flowVersionId);
   }
 
   private async getConversation(conversationId: string): Promise<Conversation | undefined> {
-    return this.conversations.get(conversationId) ?? await this.repositories.conversations.getById(conversationId);
+    if (this.repositories.conversations !== this.internalRepositories.conversations) {
+      return await this.repositories.conversations.getById(conversationId) ?? this.conversations.get(conversationId);
+    }
+    return this.conversations.get(conversationId);
   }
 
   private async getState(conversationId: string): Promise<InternalState | undefined> {
-    return (this.states.get(conversationId) ?? await this.repositories.states.getByConversationId(conversationId)) as InternalState | undefined;
+    if (this.repositories.states !== this.internalRepositories.states) {
+      return (await this.repositories.states.getByConversationId(conversationId) ?? this.states.get(conversationId)) as InternalState | undefined;
+    }
+    return this.states.get(conversationId);
   }
 
   private async runAutomaticSteps(context: TurnContext): Promise<void> {
@@ -490,9 +499,10 @@ class Runtime {
 
   private async enterCustomStep(context: TurnContext, step: StepDefinition): Promise<StepRunResult> {
     const customType = (step as any).config?.customType;
-    const handler = customType ? this.options.stepHandlers?.[customType] : undefined;
+    const registry = this.services().stepRegistry;
+    const handler = customType && registry.hasHandler(customType) ? registry.getHandler(customType) : undefined;
     if (!handler) return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Custom step handler ${customType} is not registered.`, false) };
-    const result = await handler.enter(this.stepContext(context, step));
+    const result = await handler.enter(this.stepContext(context, step) as any);
     return this.normalizeExternalStepResult(result);
   }
 
@@ -653,9 +663,10 @@ class Runtime {
 
   private async handleCustomStepInput(context: TurnContext, step: StepDefinition, input: UserInput): Promise<StepRunResult> {
     const customType = (step as any).config?.customType;
-    const handler = customType ? this.options.stepHandlers?.[customType] : undefined;
+    const registry = this.services().stepRegistry;
+    const handler = customType && registry.hasHandler(customType) ? registry.getHandler(customType) : undefined;
     if (!handler?.handleInput) return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Custom step handler ${customType} is not registered.`, false) };
-    const result = await handler.handleInput(this.stepContext(context, step), input);
+    const result = await handler.handleInput(this.stepContext(context, step) as any, input);
     return this.normalizeExternalStepResult(result);
   }
 
