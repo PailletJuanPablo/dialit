@@ -1,6 +1,12 @@
 /**
  * conversation-engine.v0.1.types.ts
  *
+ * Reference snapshot only.
+ *
+ * The package source of truth is `src/types.ts`, exported through `src/index.ts`.
+ * Keep new runtime-facing contracts in `src/types.ts`; this file remains as
+ * high-level reference material from the original architecture notes.
+ *
  * Public TypeScript contracts for a lightweight conversational engine.
  *
  * Design goals:

@@ -1460,6 +1460,7 @@ export type OperationalRuntimeErrorCode =
     | "CONVERSATION_NOT_WAITING_FOR_INPUT"
     | "CUSTOM_OPERATION_CONTRACT_NOT_REGISTERED"
     | "CUSTOM_OPERATION_RESULT_OUT_OF_CONTRACT"
+    | "EXTRACTOR_NOT_REGISTERED"
     | "FLOW_VERSION_NOT_FOUND"
     | "FLOW_CALL_CONTINUATION_INVALID"
     | "INPUT_BINDING_NOT_FOUND"
@@ -1468,6 +1469,7 @@ export type OperationalRuntimeErrorCode =
     | "LLM_RESPONSE_GENERATOR_NOT_REGISTERED"
     | "LLM_RESPONSE_USAGE_NOT_DECLARED"
     | "MAX_STEP_EXECUTIONS_EXCEEDED"
+    | "NORMALIZER_NOT_REGISTERED"
     | "OPERATION_EXECUTION_CONTEXT_REQUIRED"
     | "OPERATION_HANDLER_NOT_REGISTERED"
     | "RESPONSE_NOT_FOUND"
@@ -1567,6 +1569,11 @@ export interface UnhandledRuntimeError extends BaseRuntimeError<"unhandled_runti
 
 export interface RuntimeServices {
     stepRegistry: StepHandlerRegistry;
+    operationRegistry: OperationRegistry;
+    resolverRegistry: ResolverRegistry;
+    validatorRegistry: ValidatorRegistry;
+    normalizerRegistry: NormalizerRegistry;
+    extractorRegistry: ExtractorRegistry;
     operationExecutor: OperationExecutor;
     inputProcessor: InputProcessor;
     responseRenderer: ResponseRenderer;
@@ -1810,7 +1817,16 @@ export interface CustomOperationHandler extends OperationHandler<CustomOperation
  * ============================================================ */
 
 export interface FlowValidator {
-    validate(flow: ConversationFlowDefinition): ValidationIssue[];
+    validate(flow: ConversationFlowDefinition, options?: FlowValidationOptions): ValidationIssue[];
+}
+
+export interface FlowValidationOptions {
+    registeredStepTypes?: readonly string[];
+    registeredOperationTypes?: readonly string[];
+    registeredCustomOperationTypes?: readonly string[];
+    registeredNormalizerTypes?: readonly string[];
+    registeredExtractorTypes?: readonly string[];
+    registeredValidatorTypes?: readonly string[];
 }
 
 export interface ModelValidator {
@@ -1819,7 +1835,7 @@ export interface ModelValidator {
 
 export interface ModelValidationContext {
     registeredStepTypes: readonly StepType[];
-    registeredOperationTypes: readonly StepOperation["type"][];
+    registeredOperationTypes: readonly string[];
     registeredActionKinds?: readonly ActionKind[];
     registeredCustomOperationTypes?: readonly string[];
 }
@@ -1885,6 +1901,7 @@ export interface DecisionTraceRepository {
 export interface ConversationEngine {
     startConversation(request: StartConversationRequest): Promise<ProcessTurnResult>;
     processUserInput(request: ProcessUserInputRequest): Promise<ProcessTurnResult>;
+    processExternalEvent(request: ProcessExternalEventRequest): Promise<ProcessTurnResult>;
 }
 
 export interface StartConversationRequest {
@@ -1899,6 +1916,11 @@ export interface StartConversationRequest {
 export interface ProcessUserInputRequest {
     conversationId: ConversationId;
     input: UserInput;
+}
+
+export interface ProcessExternalEventRequest {
+    conversationId: ConversationId;
+    event: EventUserInput;
 }
 
 export interface ProcessTurnResult {
@@ -1968,6 +1990,11 @@ export interface CreateConversationEngineOptions {
     idGenerator?: Partial<IdGenerator>;
     maxStepExecutionsPerTurn?: number;
     stepHandlers?: Record<string, StepHandler>;
+    operationHandlers?: Record<string, OperationHandler | OperationHandler["execute"]>;
+    validators?: Record<string, Validator | Validator["validate"]>;
+    normalizers?: Record<string, Normalizer | Normalizer["normalize"]>;
+    extractors?: Record<string, Extractor | Extractor["extract"]>;
+    resolvers?: Resolver[];
     actionHandlers?: Record<ActionKind, ActionHandler | ActionExecutor["execute"]>;
     customOperations?: Record<string, {
         inputSchema?: JsonObject;

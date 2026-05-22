@@ -1,6 +1,7 @@
 import type {
     ConditionExpression,
     ConversationFlowDefinition,
+    FlowValidationOptions,
     FlowValidationReport,
     ResponsePlan,
     StepBranch,
@@ -11,13 +12,21 @@ import type {
     ValidationIssue,
     ValueExpression,
 } from "./types.js";
+import { builtInExtractorTypes, builtInNormalizerTypes, builtInOperationTypes, builtInValidatorTypes } from "./runtime/constants.js";
 
-export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowValidationReport {
+export function validateFlowDefinition(flow: ConversationFlowDefinition, options: FlowValidationOptions = {}): FlowValidationReport {
     const issues: ValidationIssue[] = [];
     const stepIds = new Set(flow.steps.map((step) => step.stepId));
     const variableIds = new Set(flow.variables.map((variable) => variable.variableId));
-    const actionIds = new Set((flow.actions ?? []).map((action) => action.actionId));
+    const actions = new Map((flow.actions ?? []).map((action) => [action.actionId, action]));
+    const customOperations = new Map((flow.customOperations ?? []).map((operation) => [operation.customOperationId, operation]));
     const responseIds = new Set((flow.responses ?? []).map((response) => response.responseId));
+    const registeredStepTypes = options.registeredStepTypes === undefined ? undefined : new Set(options.registeredStepTypes);
+    const registeredOperationTypes = options.registeredOperationTypes === undefined ? undefined : new Set(options.registeredOperationTypes);
+    const registeredCustomOperationTypes = options.registeredCustomOperationTypes === undefined ? undefined : new Set(options.registeredCustomOperationTypes);
+    const registeredNormalizerTypes = options.registeredNormalizerTypes === undefined ? undefined : new Set(options.registeredNormalizerTypes);
+    const registeredExtractorTypes = options.registeredExtractorTypes === undefined ? undefined : new Set(options.registeredExtractorTypes);
+    const registeredValidatorTypes = options.registeredValidatorTypes === undefined ? undefined : new Set(options.registeredValidatorTypes);
 
     const addIssue = (code: string, message: string, entityId?: string, metadata?: Record<string, unknown>) => {
         issues.push({
@@ -91,6 +100,24 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
         }
     };
 
+    const checkNormalizer = (type: string, entityId: string) => {
+        if (registeredNormalizerTypes !== undefined && !builtInNormalizerTypes.has(type) && !registeredNormalizerTypes.has(type)) {
+            addIssue("NORMALIZER_NOT_REGISTERED", `Normalizer '${type}' is not registered.`, entityId, { normalizerType: type });
+        }
+    };
+
+    const checkExtractor = (type: string, entityId: string) => {
+        if (registeredExtractorTypes !== undefined && !builtInExtractorTypes.has(type) && !registeredExtractorTypes.has(type)) {
+            addIssue("EXTRACTOR_NOT_REGISTERED", `Extractor '${type}' is not registered.`, entityId, { extractorType: type });
+        }
+    };
+
+    const checkValidator = (type: string, entityId: string) => {
+        if (registeredValidatorTypes !== undefined && !builtInValidatorTypes.has(type) && !registeredValidatorTypes.has(type)) {
+            addIssue("VALIDATOR_NOT_REGISTERED", `Validator '${type}' is not registered.`, entityId, { validatorType: type });
+        }
+    };
+
     const checkCondition = (condition: ConditionExpression | undefined, entityId: string) => {
         if (condition === undefined) {
             return;
@@ -161,6 +188,13 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
     };
 
     const checkOperation = (operation: StepOperation, entityId: string) => {
+        if (!builtInOperationTypes.has(operation.type)) {
+            if (registeredOperationTypes !== undefined && !registeredOperationTypes.has(operation.type)) {
+                addIssue("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler '${operation.type}' is not registered.`, entityId, { operationType: operation.type });
+            }
+            return;
+        }
+
         switch (operation.type) {
             case "send_message":
                 checkResponsePlan(operation.message, entityId);
@@ -174,7 +208,8 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 checkVariable(operation.variableId, entityId);
                 return;
             case "run_action":
-                if (!actionIds.has(operation.actionId)) {
+                const action = actions.get(operation.actionId);
+                if (!action) {
                     addIssue("ACTION_NOT_FOUND", `Action '${operation.actionId}' was not found.`, entityId, { actionId: operation.actionId });
                 }
                 for (const expression of Object.values(operation.inputMapping ?? {})) {
@@ -185,6 +220,12 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 }
                 checkVariable(operation.resultVariableId, entityId);
                 for (const resultBranch of operation.onResult ?? []) {
+                    if (action && resultBranch.match.type === "outcome" && action.resultOutcomes !== undefined && !action.resultOutcomes.includes(resultBranch.match.outcome)) {
+                        addIssue("ACTION_RESULT_OUTCOME_NOT_DECLARED", `Action outcome '${resultBranch.match.outcome}' is not declared.`, entityId, { actionId: operation.actionId, outcome: resultBranch.match.outcome });
+                    }
+                    if (action && resultBranch.match.type === "error_code" && action.errorCodes !== undefined && !action.errorCodes.includes(resultBranch.match.errorCode)) {
+                        addIssue("ACTION_ERROR_CODE_NOT_DECLARED", `Action error code '${resultBranch.match.errorCode}' is not declared.`, entityId, { actionId: operation.actionId, errorCode: resultBranch.match.errorCode });
+                    }
                     checkBranch(resultBranch.branch, entityId);
                 }
                 return;
@@ -223,6 +264,12 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 }
                 return;
             case "custom":
+                if (!customOperations.has(operation.customOperationId)) {
+                    addIssue("CUSTOM_OPERATION_NOT_FOUND", `Custom operation '${operation.customOperationId}' was not found.`, entityId, { customOperationId: operation.customOperationId });
+                }
+                if (registeredCustomOperationTypes !== undefined && !registeredCustomOperationTypes.has(operation.customType)) {
+                    addIssue("CUSTOM_OPERATION_HANDLER_NOT_REGISTERED", `Custom operation type '${operation.customType}' is not registered.`, entityId, { customType: operation.customType });
+                }
                 for (const expression of Object.values(operation.inputMapping ?? {})) {
                     checkValueExpression(expression, entityId);
                 }
@@ -268,7 +315,14 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 checkResponsePlan(step.config.prompt, entityId);
                 for (const binding of step.config.input.bindings ?? []) {
                     checkVariable(binding.targetVariableId, entityId);
+                    for (const normalizer of binding.normalizers ?? []) {
+                        checkNormalizer(normalizer.type, entityId);
+                    }
+                    for (const extractor of binding.extractors ?? []) {
+                        checkExtractor(extractor.type, entityId);
+                    }
                     for (const validator of binding.validators ?? []) {
+                        checkValidator(validator.type, entityId);
                         checkResponsePlan(validator.message, entityId);
                     }
                 }
@@ -289,7 +343,11 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
             case "attachment":
                 checkResponsePlan(step.config.prompt, entityId);
                 checkVariable(step.config.targetVariableId, entityId);
+                if (step.config.rules.maxFiles !== undefined && (!Number.isInteger(step.config.rules.maxFiles) || step.config.rules.maxFiles < 1)) {
+                    addIssue("INVALID_ATTACHMENT_RULES", "Attachment maxFiles must be a positive integer.", entityId);
+                }
                 for (const validator of step.config.rules.validators ?? []) {
+                    checkValidator(validator.type, entityId);
                     checkResponsePlan(validator.message, entityId);
                 }
                 checkResponsePlan(step.config.invalidAttachment?.message, entityId);
@@ -304,6 +362,11 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 return;
             case "end":
                 checkResponsePlan(step.config.finalMessage, entityId);
+                return;
+            case "custom":
+                if (registeredStepTypes !== undefined && !registeredStepTypes.has(step.config.customType)) {
+                    addIssue("STEP_HANDLER_NOT_REGISTERED", `Step handler '${step.config.customType}' is not registered.`, entityId, { stepType: step.config.customType });
+                }
         }
     };
 

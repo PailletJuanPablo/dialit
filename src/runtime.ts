@@ -19,14 +19,22 @@ import type {
   FlowVersion,
   IdGenerator,
   InvalidGeneratedResponseVariableRuntimeError,
+  InputBinding,
+  InputContract,
   InputProcessingContext,
   InputStepDefinition,
   InvalidInputBehavior,
+  NormalizationContext,
+  NormalizerDefinition,
+  ExtractionContext,
+  ExtractionResult,
+  ExtractorDefinition,
   MenuOption,
   MenuStepDefinition,
   MessageStepDefinition,
   MissingVariableReferenceRuntimeError,
   OperationExecutionContext,
+  OperationResult,
   OperationalRuntimeError,
   OperationalRuntimeErrorCode,
   OutboundMessage,
@@ -49,14 +57,25 @@ import type {
   TraceFragment,
   Turn,
   UserInput,
+  ValidationContext,
   ValidatorDefinition,
+  ValidationResult,
   VariablePatch,
   VariableScope,
   VariableValueSource,
   ValueExpression,
 } from "./types.js";
 import { clone } from "./runtime-support.js";
-import { builtInOperationTypes, defaultFlowCallSharingScopes } from "./runtime/constants.js";
+import {
+  builtInExtractorTypes,
+  builtInNormalizerTypes,
+  builtInOperationTypes,
+  builtInValidatorTypes,
+  bytesPerMegabyte,
+  defaultFlowCallSharingScopes,
+  globalCommandAliases,
+  globalCommandOutcomes,
+} from "./runtime/constants.js";
 import {
   emptyRendered,
   isLlmGeneratedResponse,
@@ -83,6 +102,8 @@ import type {
   StepRunResult,
   TurnContext,
 } from "./runtime/internal-types.js";
+
+type GlobalCommandName = keyof typeof globalCommandOutcomes;
 
 export function createConversationEngine(options: EngineOptions = {}): ConversationEngine & ConversationEngineModule {
   const runtime = new Runtime(options);
@@ -155,6 +176,7 @@ class Runtime {
     return {
       startConversation: (request) => this.startConversation(request),
       processUserInput: (request) => this.processUserInput(request),
+      processExternalEvent: (request) => this.processUserInput({ conversationId: request.conversationId, input: request.event }),
       repositories: this.repositories,
       services: this.services(),
       runtime: this.runtimeContext,
@@ -553,19 +575,25 @@ class Runtime {
   }
 
   private async handleInputStepInput(context: TurnContext, step: InputStepDefinition, input: UserInput): Promise<StepRunResult> {
-    if (input.type !== "text") return this.invalidInput(context, step, "Input must be text.");
     const contract = step.config.input;
-    const binding = contract.bindings?.[0];
-    if (!binding) return { status: "failed", error: this.runtimeError("INPUT_BINDING_NOT_FOUND", `Input step ${step.stepId} has no binding.`, false) };
-    const raw = input.text;
-    const value = raw.trim();
-    for (const validator of binding?.validators ?? []) {
-      const validation = this.validateValue(value, validator);
-      if (validation.error) return { status: "failed", error: validation.error };
-      if (!validation.valid) return this.invalidInput(context, step, validator.message ?? "Input is invalid.");
+    if (!contract.acceptedInputTypes.includes(input.type)) return this.invalidInput(context, step, `Input type ${input.type} is not accepted.`);
+
+    const globalCommand = this.resolveGlobalCommand(contract, input);
+    if (globalCommand) {
+      return {
+        status: "completed",
+        outcome: globalCommandOutcomes[globalCommand],
+        events: [this.event(context, "input_resolved", { stepId: step.stepId, command: globalCommand })],
+        fragments: [{ source: "input:global_command", data: { command: globalCommand, outcome: globalCommandOutcomes[globalCommand] } }],
+      };
     }
-    const patches: VariablePatch[] = [{ type: "set", variableId: binding.targetVariableId, value, source: "user_input" }];
-    const fragments: TraceFragment[] = [{ source: "input:resolve", data: { status: "resolved", variableId: binding.targetVariableId } }];
+
+    const bindingResult = await this.resolveInputBindings(context, step, input, contract.bindings ?? []);
+    if (bindingResult.error) return { status: "failed", error: bindingResult.error };
+    if (!bindingResult.valid) return this.invalidInput(context, step, bindingResult.message ?? "Input is invalid.");
+
+    const patches = bindingResult.patches;
+    const fragments = bindingResult.fragments;
 
     for (const task of contract.semanticTasks ?? []) {
       if (task.mode !== "after_valid_capture") continue;
@@ -595,15 +623,206 @@ class Runtime {
     return { status: "completed", outcome: "captured", patches, events: [this.event(context, "input_resolved", { stepId: step.stepId })], fragments };
   }
 
+  private resolveGlobalCommand(contract: InputContract, input: UserInput): GlobalCommandName | undefined {
+    if (input.type !== "text") return undefined;
+    const text = input.text.trim().toLowerCase();
+    if (contract.globalCommands?.allowCancel && matchesAlias(globalCommandAliases.cancel, text)) return "cancel";
+    if (contract.globalCommands?.allowHelp && matchesAlias(globalCommandAliases.help, text)) return "help";
+    if (contract.globalCommands?.allowBack && matchesAlias(globalCommandAliases.back, text)) return "back";
+    if (contract.globalCommands?.allowHandoff && matchesAlias(globalCommandAliases.handoff, text)) return "handoff";
+    return undefined;
+  }
+
+  private async resolveInputBindings(
+    context: TurnContext,
+    step: InputStepDefinition,
+    input: UserInput,
+    bindings: InputBinding[],
+  ): Promise<{ valid: boolean; patches: VariablePatch[]; fragments: TraceFragment[]; message?: string; error?: RuntimeError }> {
+    if (bindings.length === 0) {
+      return {
+        valid: false,
+        patches: [],
+        fragments: [],
+        error: this.runtimeError("INPUT_BINDING_NOT_FOUND", `Input step ${step.stepId} has no bindings.`, false),
+      };
+    }
+
+    const patches: VariablePatch[] = [];
+    const fragments: TraceFragment[] = [];
+    for (const binding of bindings) {
+      const bindingResult = await this.resolveInputBinding(context, step, input, binding);
+      if (bindingResult.error) return { valid: false, patches, fragments, error: bindingResult.error };
+      if (!bindingResult.valid) return { valid: false, patches, fragments, message: bindingResult.message };
+      if (bindingResult.patch) patches.push(bindingResult.patch);
+      fragments.push(...bindingResult.fragments);
+    }
+
+    return { valid: true, patches, fragments };
+  }
+
+  private async resolveInputBinding(
+    context: TurnContext,
+    step: InputStepDefinition,
+    input: UserInput,
+    binding: InputBinding,
+  ): Promise<{ valid: boolean; fragments: TraceFragment[]; patch?: VariablePatch; message?: string; error?: RuntimeError }> {
+    if (binding.source !== input.type) {
+      return binding.required
+        ? { valid: false, fragments: [], message: `Input source ${binding.source} is required.` }
+        : { valid: true, fragments: [] };
+    }
+
+    const rawInput = this.inputValue(input);
+    if (rawInput === undefined) {
+      return binding.required
+        ? { valid: false, fragments: [], message: `Input source ${binding.source} is required.` }
+        : { valid: true, fragments: [] };
+    }
+
+    let value: unknown = rawInput;
+    for (const normalizer of binding.normalizers ?? []) {
+      const normalized = await this.normalizeInputValue(context, step, input, value, normalizer);
+      if (normalized.error) return { valid: false, fragments: [], error: normalized.error };
+      value = normalized.value;
+    }
+
+    for (const extractor of binding.extractors ?? []) {
+      const extracted = await this.extractInputValue(context, step, input, value, extractor);
+      if (extracted.error) return { valid: false, fragments: [], error: extracted.error };
+      if (!extracted.result.matched) return { valid: false, fragments: [], message: `Extractor ${extractor.type} did not match.` };
+      value = "value" in extracted.result ? extracted.result.value : extracted.result.values;
+    }
+
+    for (const validator of binding.validators ?? []) {
+      const validation = await this.validateValue(context, step, value, validator, binding.targetVariableId);
+      if (validation.error) return { valid: false, fragments: [], error: validation.error };
+      if (!validation.result.valid) return { valid: false, fragments: [], message: validation.result.reason ?? "Input is invalid." };
+      if ("normalizedValue" in validation.result) value = validation.result.normalizedValue;
+    }
+
+    const metadata = binding.saveRawInput ? { rawInput } : undefined;
+    return {
+      valid: true,
+      patch: { type: "set", variableId: binding.targetVariableId, value, source: "user_input", ...(metadata === undefined ? {} : { metadata }) },
+      fragments: [{ source: "input:binding", data: { status: "resolved", variableId: binding.targetVariableId, source: binding.source } }],
+    };
+  }
+
+  private inputValue(input: UserInput): unknown {
+    switch (input.type) {
+      case "text":
+        return input.text;
+      case "choice":
+        return input.optionId ?? input.label ?? input.payload;
+      case "attachment":
+        return input.attachments;
+      case "payload":
+        return input.payload;
+      case "event":
+        return input.eventType;
+    }
+  }
+
+  private async normalizeInputValue(
+    context: TurnContext,
+    step: StepDefinition,
+    input: UserInput,
+    value: unknown,
+    normalizer: NormalizerDefinition,
+  ): Promise<{ value: unknown; error?: RuntimeError }> {
+    if (builtInNormalizerTypes.has(normalizer.type)) {
+      return { value: this.applyBuiltInNormalizer(value, normalizer) };
+    }
+
+    const registry = this.services().normalizerRegistry;
+    if (!registry.hasNormalizer(normalizer.type)) {
+      return { value, error: this.runtimeError("NORMALIZER_NOT_REGISTERED", `Normalizer ${normalizer.type} is not registered.`, false) };
+    }
+    const normalizationContext: NormalizationContext = { ...this.baseExecutionContext(context, step), input };
+    return { value: await registry.getNormalizer(normalizer.type).normalize(value, normalizer, normalizationContext) };
+  }
+
+  private applyBuiltInNormalizer(value: unknown, normalizer: NormalizerDefinition): unknown {
+    if (typeof value !== "string") return value;
+    if (normalizer.type === "trim") return value.trim();
+    if (normalizer.type === "lowercase") return value.toLowerCase();
+    if (normalizer.type === "uppercase") return value.toUpperCase();
+    if (normalizer.type === "collapse_spaces") return value.replace(/\s+/g, " ");
+    return value;
+  }
+
+  private async extractInputValue(
+    context: TurnContext,
+    step: StepDefinition,
+    input: UserInput,
+    value: unknown,
+    extractor: ExtractorDefinition,
+  ): Promise<{ result: ExtractionResult; error?: RuntimeError }> {
+    if (builtInExtractorTypes.has(extractor.type)) {
+      return { result: this.applyBuiltInExtractor(input, value, extractor) };
+    }
+
+    const registry = this.services().extractorRegistry;
+    if (!registry.hasExtractor(extractor.type)) {
+      return { result: { matched: false }, error: this.runtimeError("EXTRACTOR_NOT_REGISTERED", `Extractor ${extractor.type} is not registered.`, false) };
+    }
+    const extractionContext: ExtractionContext = this.baseExecutionContext(context, step);
+    return { result: await registry.getExtractor(extractor.type).extract(input, extractor, extractionContext) };
+  }
+
+  private applyBuiltInExtractor(input: UserInput, value: unknown, extractor: ExtractorDefinition): ExtractionResult {
+    const text = String(value);
+    if (extractor.type === "raw_text") return { matched: true, value };
+    if (extractor.type === "regex") {
+      const pattern = String(extractor.options?.pattern ?? "");
+      const flags = typeof extractor.options?.flags === "string" ? extractor.options.flags : undefined;
+      const group = Number(extractor.options?.group ?? 0);
+      const match = new RegExp(pattern, flags).exec(text);
+      return match && match[group] !== undefined ? { matched: true, value: match[group] } : { matched: false };
+    }
+    if (extractor.type === "number") return Number.isNaN(Number(text)) ? { matched: false } : { matched: true, value: Number(text) };
+    if (extractor.type === "integer") return /^-?\d+$/.test(text) ? { matched: true, value: Number(text) } : { matched: false };
+    if (extractor.type === "email") {
+      const match = /[^\s@]+@[^\s@]+\.[^\s@]+/.exec(text);
+      return match ? { matched: true, value: match[0] } : { matched: false };
+    }
+    if (extractor.type === "phone") {
+      const match = /[+() \d-]{6,}/.exec(text);
+      return match ? { matched: true, value: match[0].trim() } : { matched: false };
+    }
+    if (extractor.type === "date") {
+      const timestamp = Date.parse(text);
+      return Number.isNaN(timestamp) ? { matched: false } : { matched: true, value: new Date(timestamp).toISOString().slice(0, 10) };
+    }
+    if (extractor.type === "event_type" && input.type === "event") return { matched: true, value: input.eventType };
+    if (extractor.type === "payload_path" && input.type === "payload") {
+      const valueAtPath = this.valueAtPath(input.payload, String(extractor.options?.path ?? ""));
+      return valueAtPath === undefined ? { matched: false } : { matched: true, value: valueAtPath };
+    }
+    return { matched: false };
+  }
+
   private async handleAttachmentInput(context: TurnContext, step: AttachmentStepDefinition, input: UserInput): Promise<StepRunResult> {
     if (input.type !== "attachment") return this.invalidInput(context, step, "Input must be an attachment.");
-    const attachment = input.attachments[0];
+    if (step.config.rules.required === false && input.attachments.length === 0) {
+      return {
+        status: "completed",
+        outcome: "skipped",
+        fragments: [{ source: "attachment:validate", data: { valid: true, skipped: true } }],
+      };
+    }
     const rules = step.config.rules;
-    const extension = attachment?.filename?.slice(attachment.filename.lastIndexOf(".")).toLowerCase();
+    const attachment = input.attachments[0];
     const valid = attachment !== undefined
-      && (!rules.allowedMimeTypes || rules.allowedMimeTypes.includes(attachment.mimeType))
-      && (!rules.allowedExtensions || (extension !== undefined && rules.allowedExtensions.includes(extension)))
-      && (!rules.maxSizeMb || attachment.sizeBytes <= rules.maxSizeMb * 1024 * 1024);
+      && (rules.maxFiles === undefined || input.attachments.length <= rules.maxFiles)
+      && input.attachments.every((candidate) => {
+        const extensionIndex = candidate.filename?.lastIndexOf(".") ?? -1;
+        const extension = extensionIndex >= 0 ? candidate.filename?.slice(extensionIndex).toLowerCase() : undefined;
+        return (!rules.allowedMimeTypes || rules.allowedMimeTypes.includes(candidate.mimeType))
+          && (!rules.allowedExtensions || (extension !== undefined && rules.allowedExtensions.includes(extension)))
+          && (!rules.maxSizeMb || candidate.sizeBytes <= rules.maxSizeMb * bytesPerMegabyte);
+      });
     if (!valid) {
       const rendered = await this.renderInvalid(context, step, step.config.invalidAttachment);
       return {
@@ -615,10 +834,25 @@ class Runtime {
       };
     }
     if (!attachment) return this.invalidInput(context, step, "Attachment is required.");
+    for (const validator of rules.validators ?? []) {
+      const validation = await this.validateValue(context, step, input.attachments, validator, step.config.targetVariableId);
+      if (validation.error) return { status: "failed", error: validation.error };
+      if (!validation.result.valid) {
+        const rendered = await this.renderInvalid(context, step, step.config.invalidAttachment);
+        return {
+          status: "waiting_input",
+          messages: rendered.messages,
+          events: [this.event(context, "input_invalid", { stepId: step.stepId, reason: validation.result.reason ?? "invalid_attachment" })],
+          fragments: [{ source: "attachment:validate", data: { valid: false, validator: validator.type } }],
+          waitState: { stepId: step.stepId, retryCount: ((context.state.pendingInput?.retryCount ?? 0) + 1) },
+        };
+      }
+    }
+    const attachmentValue = input.attachments.length === 1 ? attachment : input.attachments;
     return {
       status: "completed",
       outcome: "captured",
-      patches: [{ type: "set", variableId: step.config.targetVariableId, value: attachment, source: "attachment" }],
+      patches: [{ type: "set", variableId: step.config.targetVariableId, value: attachmentValue, source: "attachment" }],
       events: [this.event(context, "input_resolved", { stepId: step.stepId })],
       fragments: [{ source: "attachment:validate", data: { valid: true, filename: attachment?.filename, mimeType: attachment?.mimeType } }],
     };
@@ -698,19 +932,39 @@ class Runtime {
     };
   }
 
-  private validateValue(value: string, validator: ValidatorDefinition): { valid: boolean; error?: RuntimeError } {
-    if (validator.type === "regex") return { valid: new RegExp(String(validator.options?.pattern ?? "")).test(value) };
-    if (validator.type === "integer") return { valid: /^-?\d+$/.test(value) };
-    if (validator.type === "number") return { valid: !Number.isNaN(Number(value)) };
-    if (validator.type === "required") return { valid: value.length > 0 };
-    if (validator.type === "email") return { valid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) };
-    if (validator.type === "min_length") return { valid: value.length >= Number(validator.options?.min ?? validator.options?.value ?? 0) };
-    if (validator.type === "max_length") return { valid: value.length <= Number(validator.options?.max ?? validator.options?.value ?? Number.MAX_SAFE_INTEGER) };
+  private async validateValue(
+    context: TurnContext,
+    step: StepDefinition,
+    value: unknown,
+    validator: ValidatorDefinition,
+    variableId?: string,
+  ): Promise<{ result: ValidationResult; error?: RuntimeError }> {
+    if (builtInValidatorTypes.has(validator.type)) {
+      return { result: this.applyBuiltInValidator(value, validator) };
+    }
+
+    const registry = this.services().validatorRegistry;
+    if (!registry.hasValidator(validator.type)) {
+      return { result: { valid: false }, error: this.runtimeError("VALIDATOR_NOT_REGISTERED", `Validator ${validator.type} is not registered.`, false) };
+    }
+    const validationContext: ValidationContext = { ...this.baseExecutionContext(context, step), ...(variableId === undefined ? {} : { variableId }) };
+    return { result: await registry.getValidator(validator.type).validate(value, validator, validationContext) };
+  }
+
+  private applyBuiltInValidator(value: unknown, validator: ValidatorDefinition): ValidationResult {
+    const text = String(value ?? "");
+    if (validator.type === "regex") return { valid: new RegExp(String(validator.options?.pattern ?? "")).test(text) };
+    if (validator.type === "integer") return { valid: /^-?\d+$/.test(text) };
+    if (validator.type === "number") return { valid: !Number.isNaN(Number(text)) };
+    if (validator.type === "required") return { valid: text.length > 0 };
+    if (validator.type === "email") return { valid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text) };
+    if (validator.type === "min_length") return { valid: text.length >= Number(validator.options?.min ?? validator.options?.value ?? 0) };
+    if (validator.type === "max_length") return { valid: text.length <= Number(validator.options?.max ?? validator.options?.value ?? Number.MAX_SAFE_INTEGER) };
     if (validator.type === "enum") {
       const values = validator.options?.values;
-      return { valid: Array.isArray(values) && values.includes(value) };
+      return { valid: Array.isArray(values) && values.some((candidate) => Object.is(candidate, value)) };
     }
-    return { valid: false, error: this.runtimeError("VALIDATOR_NOT_REGISTERED", `Validator ${validator.type} is not registered.`, false) };
+    return { valid: false };
   }
 
   private async executeBranch(context: TurnContext, step: StepDefinition, branch: StepBranch, continuation?: OperationContinuationBase): Promise<StepRunResult> {
@@ -735,7 +989,7 @@ class Runtime {
     for (let index = startIndex; index < operations.length; index++) {
       const operation = operations[index];
       if (!operation) continue;
-      if (!builtInOperationTypes.has(operation.type)) {
+      if (!builtInOperationTypes.has(operation.type) && !this.services().operationRegistry.hasHandler(operation.type)) {
         return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operation.type} is not registered.`, false) };
       }
       context.events.push(this.event(context, "operation_started", { operationType: operation.type, operationId: operation.operationId }));
@@ -820,7 +1074,12 @@ class Runtime {
       if (context.error) return { status: "failed", error: context.error };
       return { status: "completed", events: [this.event(context, operation.eventType, payload)], fragments: [{ source: "operation:emit_event", data: { eventType: operation.eventType } }] };
     }
-    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${runtimeTypeOf(operation)} is not registered.`, false) };
+    const operationType = runtimeTypeOf(operation);
+    const registry = this.services().operationRegistry;
+    if (registry.hasHandler(operationType)) {
+      return this.normalizeExternalOperationResult(await registry.getHandler(operationType).execute(operation, this.operationContext(context, step)));
+    }
+    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${operationType} is not registered.`, false) };
   }
 
   private async executeAction(context: TurnContext, step: StepDefinition, operation: Extract<StepOperation, { type: "run_action" }>): Promise<StepRunResult> {
@@ -1663,6 +1922,13 @@ class Runtime {
     return undefined;
   }
 
+  private valueAtPath(value: unknown, path: string): unknown {
+    if (path.length === 0) return value;
+    return path.split(".").reduce<unknown>((current, segment) => (
+      isObjectRecord(current) ? current[segment] : undefined
+    ), value);
+  }
+
   private resolveMapping(context: TurnContext, mapping: Record<string, ValueExpression>): Record<string, unknown> {
     return Object.fromEntries(Object.entries(mapping).map(([key, expression]) => [key, this.resolveValue(context, expression)]));
   }
@@ -2024,6 +2290,19 @@ class Runtime {
       error: result.error,
     };
   }
+
+  private normalizeExternalOperationResult(result: OperationResult): StepRunResult {
+    return {
+      status: result.status === "failed" ? "failed" : "completed",
+      outcome: result.outcome,
+      branch: result.branch,
+      messages: result.messages,
+      patches: result.variablePatches,
+      events: result.events,
+      fragments: [result.trace],
+      error: result.error,
+    };
+  }
 }
 
 function runtimeErrorMetadata(error: RuntimeError): Record<string, unknown> {
@@ -2093,4 +2372,12 @@ function operationalRuntimeErrorMetadata(error: OperationalRuntimeError): Record
   delete metadata.message;
   delete metadata.recoverable;
   return metadata;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function matchesAlias(aliases: readonly string[], text: string): boolean {
+  return aliases.includes(text);
 }
