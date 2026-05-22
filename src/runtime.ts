@@ -281,11 +281,15 @@ class Runtime {
   private async processUserInput(request: { conversationId: string; input: UserInput }): Promise<ProcessTurnResult> {
     const conversation = await this.getConversation(request.conversationId);
     const existingState = await this.getState(request.conversationId);
-    const flow = existingState ? await this.getFlowVersion(existingState.flowVersionId) : undefined;
+    const activeFlowCallFrame = existingState ? this.activeFlowCallFrame(existingState) : undefined;
+    const flow = activeFlowCallFrame
+      ? await this.getFlowVersion(activeFlowCallFrame.flowVersionId)
+      : existingState ? await this.getFlowVersion(existingState.flowVersionId) : undefined;
     const safeConversation = conversation ?? this.createConversation({ conversationId: request.conversationId, flowVersionId: flow?.flowVersionId ?? "unknown" }, flow);
     const safeState = existingState ?? this.createInitialState(safeConversation, flow, {});
     const turn = this.createTurn(request.conversationId, request.input);
     const context = this.createContext(flow, safeConversation, clone(safeState), turn, request.input);
+    if (activeFlowCallFrame) this.loadFlowCallChildState(context.state, activeFlowCallFrame);
 
     if (!conversation || !existingState) {
       return this.fail(context, "CONVERSATION_NOT_FOUND", `Conversation ${request.conversationId} was not found.`, false);
@@ -309,6 +313,7 @@ class Runtime {
     if (result.error) return this.failWithError(context, result.error);
     await this.applyStepResult(context, step, result);
     await this.runAutomaticSteps(context);
+    if (activeFlowCallFrame) return this.finishFlowCallInputTurn(context, activeFlowCallFrame);
     return this.commit(context);
   }
 
@@ -358,7 +363,7 @@ class Runtime {
     context.fragments.push({ source: `step:${stepType}`, data: { stepId: step.stepId, phase: "enter" } });
 
     const onEnter = await this.executeOperations(context, step, (step as any).onEnter ?? []);
-    if (onEnter.error || onEnter.target) return onEnter;
+    if (onEnter.error || onEnter.target || onEnter.status === "waiting_input") return onEnter;
 
     if (stepType === "message") return this.enterMessageStep(context, step);
     if (stepType === "menu") return this.enterMenuStep(context, step);
@@ -382,9 +387,10 @@ class Runtime {
     this.collect(context, result);
     if (context.error) return;
     if (result.status === "waiting_input") {
+      const pendingStepId = String(result.waitState?.stepId ?? step.stepId);
       context.state.status = "waiting_input";
-      context.state.pendingInput = { stepId: step.stepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
-      context.state.currentStepId = step.stepId;
+      context.state.pendingInput = { stepId: pendingStepId, createdAt: this.clock.now(), ...(result.waitState ?? {}) } as any;
+      context.state.currentStepId = pendingStepId;
       return;
     }
 
@@ -761,6 +767,7 @@ class Runtime {
       context.events.push(this.event(context, "operation_started", { operationType: operation.type, operationId: operation.operationId }));
       const result = await this.executeOperation(context, step, operation);
       this.collect(context, result);
+      if (result.status === "waiting_input") return result;
       if (result.error) {
         context.events.push(this.event(context, "operation_failed", { operationType: operation.type, operationId: operation.operationId, code: result.error.code }));
         return result;
@@ -885,6 +892,7 @@ class Runtime {
     if (context.error) return { status: "failed", error: context.error };
     const parentFrame = this.captureFlowCallFrame(context.state);
     const beforeScopedVariables = clone(context.state.scopedVariables);
+    const beforeVariableHistory = clone(context.state.variableHistory);
     const sharing = this.flowCallSharingPolicy(operation);
     const childContext: TurnContext = { ...context, flow: childFlow, nested: true, initialStepId: childFlow.definition.startStepId };
     childContext.state.currentStepId = childFlow.definition.startStepId;
@@ -895,13 +903,28 @@ class Runtime {
     context.events.push(this.event(context, "flow_call_started", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId }));
     await this.runAutomaticSteps(childContext);
     const afterScopedVariables = clone(context.state.scopedVariables);
+    const afterVariableHistory = clone(context.state.variableHistory);
+    if (String(childContext.state.status) === "waiting_input") {
+      const childCurrentStepId = childContext.state.currentStepId;
+      const childPendingInput = clone(childContext.state.pendingInput ?? { stepId: childCurrentStepId });
+      const frame = this.createFlowCallFrame(childFlow, step, operation, parentFrame, beforeScopedVariables, beforeVariableHistory, afterScopedVariables, afterVariableHistory);
+      frame.currentStepId = childCurrentStepId;
+      this.restoreFlowCallParentState(context.state, beforeScopedVariables, beforeVariableHistory, parentFrame);
+      context.state.executionStack = [...context.state.executionStack, frame];
+      context.events.push(this.event(context, "flow_call_waiting_input", { flowVersionId: childFlow.flowVersionId, operationId: operation.operationId, stepId: childCurrentStepId }));
+      return {
+        status: "waiting_input",
+        waitState: childPendingInput as Record<string, unknown>,
+        fragments: [{ source: "operation:call_flow", data: { operationId: operation.operationId, flowVersionId: childFlow.flowVersionId, status: "waiting_input" } }],
+      };
+    }
     if (childContext.error) {
-      this.restoreFlowCallVariables(context.state, beforeScopedVariables, beforeScopedVariables, sharing);
-      this.restoreFlowCallFrame(context.state, parentFrame);
+      this.restoreFlowCallParentState(context.state, beforeScopedVariables, beforeVariableHistory, parentFrame);
       return { status: "failed", error: childContext.error };
     }
     const output = this.flowCallOutputPatches(context, childFlow, operation.outputMapping ?? {}, afterScopedVariables, operation.operationId);
     const sharingResult = this.restoreFlowCallVariables(context.state, beforeScopedVariables, afterScopedVariables, sharing);
+    context.state.variableHistory = beforeVariableHistory;
     this.restoreFlowCallFrame(context.state, parentFrame);
     if (output.error) return { status: "failed", error: output.error };
     context.state.status = "active";
@@ -938,6 +961,70 @@ class Runtime {
     state.currentStepId = frame.currentStepId;
     state.status = frame.status;
     state.pendingInput = clone(frame.pendingInput);
+  }
+
+  private createFlowCallFrame(
+    childFlow: FlowVersion,
+    step: StepDefinition,
+    operation: any,
+    parentFrame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">,
+    parentScopedVariables: InternalState["scopedVariables"],
+    parentVariableHistory: InternalState["variableHistory"],
+    childScopedVariables: InternalState["scopedVariables"],
+    childVariableHistory: InternalState["variableHistory"],
+  ) {
+    return {
+      frameId: this.newId("newExecutionFrameId", "frame"),
+      flowVersionId: childFlow.flowVersionId,
+      flowId: childFlow.flowId,
+      currentStepId: childFlow.definition.startStepId,
+      callOperationId: operation.operationId,
+      calledFromStepId: step.stepId,
+      startedAt: this.clock.now(),
+      metadata: {
+        kind: "flow_call",
+        operation: clone(operation),
+        parentFrame: clone(parentFrame),
+        parentScopedVariables: clone(parentScopedVariables),
+        parentVariableHistory: clone(parentVariableHistory),
+        childScopedVariables: clone(childScopedVariables),
+        childVariableHistory: clone(childVariableHistory),
+      },
+    };
+  }
+
+  private activeFlowCallFrame(state: InternalState) {
+    const frame = state.executionStack.at(-1);
+    return (frame?.metadata as any)?.kind === "flow_call" ? frame : undefined;
+  }
+
+  private loadFlowCallChildState(state: InternalState, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>): void {
+    const metadata = frame.metadata as any;
+    state.scopedVariables = clone(metadata.childScopedVariables ?? {});
+    state.variableHistory = clone(metadata.childVariableHistory ?? {});
+    this.rebuildVariablesFromScoped(state);
+  }
+
+  private restoreFlowCallParentState(
+    state: InternalState,
+    scopedVariables: InternalState["scopedVariables"],
+    variableHistory: InternalState["variableHistory"],
+    frame: Pick<InternalState, "currentStepId" | "status" | "pendingInput">,
+  ): void {
+    state.scopedVariables = clone(scopedVariables);
+    state.variableHistory = clone(variableHistory);
+    this.rebuildVariablesFromScoped(state);
+    this.restoreFlowCallFrame(state, frame);
+  }
+
+  private rebuildVariablesFromScoped(state: InternalState): void {
+    state.variables = {};
+    for (const variable of Object.values(state.scopedVariables)) {
+      const scope = variable.scope ?? "conversation";
+      if (scope === "conversation" || !(variable.variableId in state.variables)) {
+        state.variables[variable.variableId] = variable;
+      }
+    }
   }
 
   private flowCallSharingPolicy(operation: any): { scopes: Set<VariableScope>; include?: Set<string>; exclude: Set<string> } {
@@ -1026,6 +1113,65 @@ class Runtime {
       outputVariables.push(targetVariableId);
     }
     return { patches, outputVariables: outputVariables.sort() };
+  }
+
+  private async finishFlowCallInputTurn(context: TurnContext, frame: NonNullable<ReturnType<Runtime["activeFlowCallFrame"]>>): Promise<ProcessTurnResult> {
+    const metadata = frame.metadata as any;
+    const parentFlow = await this.getFlowVersion(context.state.flowVersionId);
+    if (!parentFlow) return this.fail(context, "FLOW_VERSION_NOT_FOUND", `Flow version ${context.state.flowVersionId} was not found.`, false);
+
+    const childScopedVariables = clone(context.state.scopedVariables);
+    const childVariableHistory = clone(context.state.variableHistory);
+    if (context.state.status === "waiting_input") {
+      const childPendingInput = clone(context.state.pendingInput);
+      metadata.childScopedVariables = childScopedVariables;
+      metadata.childVariableHistory = childVariableHistory;
+      frame.currentStepId = context.state.currentStepId;
+      this.restoreFlowCallParentState(context.state, metadata.parentScopedVariables, metadata.parentVariableHistory, metadata.parentFrame);
+      context.state.executionStack = [...context.state.executionStack.slice(0, -1), frame];
+      context.state.status = "waiting_input";
+      context.state.pendingInput = childPendingInput;
+      context.state.currentStepId = String(context.state.pendingInput?.stepId ?? frame.currentStepId);
+      return this.commit(context);
+    }
+
+    this.restoreFlowCallParentState(context.state, metadata.parentScopedVariables, metadata.parentVariableHistory, metadata.parentFrame);
+    context.state.executionStack = context.state.executionStack.slice(0, -1);
+
+    if (context.error) return this.failWithError(context, context.error);
+
+    context.flow = parentFlow;
+    const parentStep = this.getStep(parentFlow, frame.calledFromStepId ?? context.state.currentStepId);
+    if (!parentStep) return this.fail(context, "STEP_NOT_FOUND", "Flow call parent step was not found.", false);
+    const operation = metadata.operation;
+    const childFlow = await this.getFlowVersion(frame.flowVersionId);
+    if (!childFlow) return this.fail(context, "FLOW_VERSION_NOT_FOUND", `Flow version ${frame.flowVersionId} was not found.`, false);
+    const mappedOutput = this.flowCallOutputPatches(context, childFlow, operation.outputMapping ?? {}, childScopedVariables, operation.operationId);
+    if (mappedOutput.error) return this.failWithError(context, mappedOutput.error);
+    const sharing = this.flowCallSharingPolicy(operation);
+    const sharingResult = this.restoreFlowCallVariables(context.state, metadata.parentScopedVariables, childScopedVariables, sharing);
+    context.state.variableHistory = metadata.parentVariableHistory;
+    context.events.push(this.event(context, "flow_call_completed", { flowVersionId: frame.flowVersionId, operationId: operation.operationId, status: "completed" }));
+    context.events.push(this.event(context, "operation_completed", { operationType: "call_flow", operationId: operation.operationId, outcome: "completed" }));
+    const result = { status: "completed", outcome: "completed" };
+    await this.applyStepResult(context, parentStep, {
+      status: "completed",
+      outcome: "completed",
+      branch: this.matchResultBranch(operation.onResult ?? [], result),
+      patches: mappedOutput.patches,
+      fragments: [{
+        source: "operation:call_flow",
+        data: {
+          operationId: operation.operationId,
+          flowVersionId: frame.flowVersionId,
+          sharedVariables: sharingResult.sharedVariables,
+          isolatedVariables: sharingResult.isolatedVariables,
+          outputVariables: mappedOutput.outputVariables,
+        },
+      }],
+    });
+    await this.runAutomaticSteps(context);
+    return this.commit(context);
   }
 
   private async executeHandoff(context: TurnContext, step: StepDefinition, operation: any): Promise<StepRunResult> {

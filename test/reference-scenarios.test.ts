@@ -917,6 +917,61 @@ describe("Nexembot v0.1 spec regression coverage", () => {
     );
   });
 
+  it("resumes a called flow that is waiting for input and returns to the parent flow", async () => {
+    const runtime = engineWith(waitingFlowParent(), {
+      flowVersions: [waitingFlowChild()],
+    });
+
+    const start = await runtime.startConversation({
+      conversationId: "conversation-waiting-flow-call",
+      flowVersionId: "waiting-flow-parent-v1",
+    });
+
+    expect(start.error).toBeUndefined();
+    expect(start.state.status).toBe("waiting_input");
+    expect(start.state.currentStepId).toBe("child_question");
+    expect(texts(start)).toContain("Child question?");
+    expect(variableValue(start, "childAnswer")).toBeUndefined();
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-waiting-flow-call",
+      input: textInput("conversation-waiting-flow-call", "hello child"),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(variableValue(result, "parentAnswer")).toBe("hello child");
+    expect(variableValue(result, "childAnswer")).toBeUndefined();
+    expect(result.state.executionStack).toEqual([]);
+    expect(result.state.status).toBe("completed");
+    expect(result.state.currentStepId).toBe("parent_done");
+    expect(texts(result)).toContain("Parent received hello child.");
+    expect(traceSources(result)).toEqual(expect.arrayContaining(["operation:call_flow"]));
+  });
+
+  it("keeps child flow variable history out of the parent conversation history", async () => {
+    const runtime = engineWith(waitingFlowParent(), {
+      flowVersions: [waitingFlowChild()],
+    });
+
+    await runtime.startConversation({
+      conversationId: "conversation-child-history",
+      flowVersionId: "waiting-flow-parent-v1",
+    });
+
+    const result = await runtime.processUserInput({
+      conversationId: "conversation-child-history",
+      input: textInput("conversation-child-history", "history value"),
+    });
+
+    expect(variableHistory(result, "childAnswer")).toEqual([]);
+    expect(variableHistory(result, "parentAnswer")).toEqual([
+      expect.objectContaining({
+        nextValue: "history value",
+        source: "flow_call",
+      }),
+    ]);
+  });
+
   it("honors injected repositories, config, runtime, and exposes services in custom contexts", async () => {
     const savedConversations: unknown[] = [];
     const appendedEvents: unknown[] = [];
@@ -2000,6 +2055,52 @@ function mappedFlowChild(): FlowVersion {
           },
         ],
         routes: [route("next", branch({ target: endTarget("completed") }))],
+      }),
+    ],
+  });
+}
+
+function waitingFlowParent(): FlowVersion {
+  return flowVersion("waiting-flow-parent-v1", {
+    flowId: "waiting-flow-parent",
+    startStepId: "call_child",
+    variables: [variable("parentAnswer", "string", "conversation")],
+    steps: [
+      messageStep("call_child", [], {
+        autoAdvance: true,
+        onEnter: [
+          {
+            type: "call_flow",
+            operationId: "call_waiting_child",
+            flowVersionId: "waiting-flow-child-v1",
+            outputMapping: {
+              childAnswer: "parentAnswer",
+            },
+            variableSharing: {
+              scopes: [],
+            },
+            onResult: [
+              {
+                match: { type: "outcome", outcome: "completed" },
+                branch: branch({ target: stepTarget("parent_done") }),
+              },
+            ],
+          },
+        ],
+      }),
+      messageStep("parent_done", [{ mode: "template", template: "Parent received {{parentAnswer}}.", variableIds: ["parentAnswer"] }]),
+    ],
+  });
+}
+
+function waitingFlowChild(): FlowVersion {
+  return flowVersion("waiting-flow-child-v1", {
+    flowId: "waiting-flow-child",
+    startStepId: "child_question",
+    variables: [variable("childAnswer", "string", "conversation")],
+    steps: [
+      inputStep("child_question", "Child question?", "childAnswer", {
+        routes: [route("captured", branch({ target: endTarget("completed") }))],
       }),
     ],
   });
