@@ -13,6 +13,14 @@ const EXPLICIT_ANY_PATTERNS = [
   /Record<[^>\n]*\bany\b[^>\n]*>/,
 ];
 
+const WEAK_PATCH_PATTERNS = [
+  /as\s+RuntimeError\b/,
+  /as\s+\{\s*type\??:/,
+  /\b(?:runtimeError|attachError|fail)\([^)]*\bcode:\s*string\b/,
+  /\b[A-Za-z_$][\w$]*!\./,
+  /\b[A-Za-z_$][\w$]*!\[/,
+];
+
 describe("source type quality", () => {
   it("does not use explicit any in production sources", () => {
     const violations = sourceFiles(join(process.cwd(), SOURCE_DIRECTORY)).flatMap((absolutePath) => {
@@ -22,6 +30,20 @@ describe("source type quality", () => {
       return lines.flatMap((line, index) => {
         const hasExplicitAny = EXPLICIT_ANY_PATTERNS.some((pattern) => pattern.test(line));
         return hasExplicitAny ? [`${relativePath}:${index + 1}: ${line.trim()}`] : [];
+      });
+    });
+
+    expect(violations).toEqual([]);
+  });
+
+  it("does not hide uncertain control flow behind structural casts or non-null assertions", () => {
+    const violations = sourceFiles(join(process.cwd(), SOURCE_DIRECTORY)).flatMap((absolutePath) => {
+      const relativePath = relative(process.cwd(), absolutePath).replace(/\\/g, "/");
+      const lines = readFileSync(absolutePath, "utf8").split(/\r?\n/);
+
+      return lines.flatMap((line, index) => {
+        const hasWeakPatch = WEAK_PATCH_PATTERNS.some((pattern) => pattern.test(line));
+        return hasWeakPatch ? [`${relativePath}:${index + 1}: ${line.trim()}`] : [];
       });
     });
 

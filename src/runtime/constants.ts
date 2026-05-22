@@ -1,3 +1,5 @@
+import type { VariableScope } from "../types.js";
+
 export const builtInStepTypes = new Set(["message", "menu", "input", "attachment", "condition", "end", "custom"]);
 
 export const builtInOperationTypes = new Set([
@@ -11,3 +13,5 @@ export const builtInOperationTypes = new Set([
   "handoff",
   "custom",
 ]);
+
+export const defaultFlowCallSharingScopes = ["conversation"] satisfies readonly VariableScope[];

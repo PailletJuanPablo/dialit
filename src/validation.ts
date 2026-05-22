@@ -135,7 +135,7 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
                 return;
             default:
                 addIssue("INVALID_CONDITION_EXPRESSION", "Condition expression type is invalid.", entityId, {
-                    type: (condition as { type?: unknown }).type,
+                    type: conditionType(condition),
                 });
         }
     };
@@ -325,4 +325,8 @@ export function validateFlowDefinition(flow: ConversationFlowDefinition): FlowVa
         valid: issues.length === 0,
         issues,
     };
+}
+
+function conditionType(condition: { readonly type?: unknown }): unknown {
+    return condition.type;
 }

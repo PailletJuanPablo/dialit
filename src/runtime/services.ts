@@ -4,6 +4,7 @@ import type {
   ConditionEvaluationContext,
   ConditionExpression,
   ConversationState,
+  OperationalRuntimeErrorCode,
   RuntimeError,
   RuntimeServices,
   StepBranch,
@@ -17,7 +18,7 @@ import type { EngineOptions } from "./internal-types.js";
 
 export type RuntimeServicesDependencies = {
   options: EngineOptions;
-  runtimeError(code: string, message: string, recoverable: boolean): RuntimeError;
+  runtimeError(code: OperationalRuntimeErrorCode, message: string, recoverable: boolean): RuntimeError;
   evaluateCondition(condition: ConditionExpression, context: ConditionEvaluationContext): boolean;
   resolveRoute(step: StepDefinition, outcome: string): StepBranch | undefined;
   newTraceId(): string;

@@ -1,6 +1,6 @@
 import type {
   ActionExecutionContext,
-  AttachmentInput,
+  ActionResult,
   AttachmentStepDefinition,
   ConditionExpression,
   ConditionStepDefinition,
@@ -18,13 +18,17 @@ import type {
   FlowExecutionFrame,
   FlowVersion,
   IdGenerator,
+  InvalidGeneratedResponseVariableRuntimeError,
   InputProcessingContext,
   InputStepDefinition,
   InvalidInputBehavior,
   MenuOption,
   MenuStepDefinition,
   MessageStepDefinition,
+  MissingVariableReferenceRuntimeError,
   OperationExecutionContext,
+  OperationalRuntimeError,
+  OperationalRuntimeErrorCode,
   OutboundMessage,
   ProcessTurnResult,
   ResponsePlan,
@@ -52,12 +56,13 @@ import type {
   ValueExpression,
 } from "./types.js";
 import { clone } from "./runtime-support.js";
-import { builtInOperationTypes } from "./runtime/constants.js";
+import { builtInOperationTypes, defaultFlowCallSharingScopes } from "./runtime/constants.js";
 import {
   emptyRendered,
   isLlmGeneratedResponse,
   isScopedInitialVariables,
   isVariableScope,
+  runtimeTypeOf,
 } from "./runtime/helpers.js";
 import { createInternalRepositories } from "./runtime/repositories.js";
 import { createRuntimeServices } from "./runtime/services.js";
@@ -298,7 +303,7 @@ class Runtime {
       case "custom":
         return this.enterCustomStep(context, step);
       default:
-        return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${String((step as { type: string }).type)} is not registered.`, false) };
+        return { status: "failed", error: this.runtimeError("STEP_HANDLER_NOT_REGISTERED", `Step handler for ${runtimeTypeOf(step)} is not registered.`, false) };
     }
   }
 
@@ -592,7 +597,7 @@ class Runtime {
 
   private async handleAttachmentInput(context: TurnContext, step: AttachmentStepDefinition, input: UserInput): Promise<StepRunResult> {
     if (input.type !== "attachment") return this.invalidInput(context, step, "Input must be an attachment.");
-    const attachment = input.attachments[0] as AttachmentInput | undefined;
+    const attachment = input.attachments[0];
     const rules = step.config.rules;
     const extension = attachment?.filename?.slice(attachment.filename.lastIndexOf(".")).toLowerCase();
     const valid = attachment !== undefined
@@ -815,7 +820,7 @@ class Runtime {
       if (context.error) return { status: "failed", error: context.error };
       return { status: "completed", events: [this.event(context, operation.eventType, payload)], fragments: [{ source: "operation:emit_event", data: { eventType: operation.eventType } }] };
     }
-    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${(operation as { type: string }).type} is not registered.`, false) };
+    return { status: "failed", error: this.runtimeError("OPERATION_HANDLER_NOT_REGISTERED", `Operation handler for ${runtimeTypeOf(operation)} is not registered.`, false) };
   }
 
   private async executeAction(context: TurnContext, step: StepDefinition, operation: Extract<StepOperation, { type: "run_action" }>): Promise<StepRunResult> {
@@ -825,10 +830,14 @@ class Runtime {
     if (context.error) return { status: "failed", error: context.error };
     context.events.push(this.event(context, "action_started", { actionId: action.actionId, actionKind: action.kind }));
     const handler = this.options.actionHandlers?.[action.kind];
-    if (!handler && !this.options.services?.actionExecutor) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
-    const result = this.options.services?.actionExecutor
-      ? await this.options.services.actionExecutor.execute(action, input, this.actionContext(context, step))
-      : await (typeof handler === "function" ? handler(action, input, this.actionContext(context, step)) : handler!.execute(action, input, this.actionContext(context, step)));
+    const actionContext = this.actionContext(context, step);
+    let result: ActionResult;
+    if (this.options.services?.actionExecutor) {
+      result = await this.options.services.actionExecutor.execute(action, input, actionContext);
+    } else {
+      if (!handler) return { status: "failed", error: this.runtimeError("ACTION_HANDLER_NOT_REGISTERED", `Action handler ${action.kind} is not registered.`, false) };
+      result = typeof handler === "function" ? await handler(action, input, actionContext) : await handler.execute(action, input, actionContext);
+    }
     const outcome = result.outcome ?? result.status;
     if (action.resultOutcomes && outcome && !action.resultOutcomes.includes(outcome)) {
       return { status: "failed", error: this.runtimeError("ACTION_RESULT_OUT_OF_CONTRACT", `Action outcome ${outcome} is not declared.`, false) };
@@ -1038,7 +1047,7 @@ class Runtime {
     const sharing = operation.variableSharing;
     const includeValues = sharing?.includeVariableIds ?? operation.sharedVariableIds;
     return {
-      scopes: new Set((sharing?.scopes ?? ["conversation"]) as VariableScope[]),
+      scopes: new Set(sharing?.scopes ?? defaultFlowCallSharingScopes),
       include: includeValues ? new Set(includeValues.map(String)) : undefined,
       exclude: new Set((sharing?.excludeVariableIds ?? []).map(String)),
     };
@@ -1543,10 +1552,7 @@ class Runtime {
         if (disallowedVariableId) {
           context.events.push(this.event(context, "llm_response_generation_failed", { stepId: step.stepId, code: "invalid_generated_response_variable", variableId: disallowedVariableId }));
           context.llmUsage.push({ purpose: "response_generation", success: false });
-          this.attachError(context, "invalid_generated_response_variable", `Generated response used undeclared variable ${disallowedVariableId}.`, false, {
-            variableId: disallowedVariableId,
-            allowedVariableIds: [...allowedVariableIds],
-          });
+          this.attachRuntimeError(context, this.invalidGeneratedResponseVariableError(disallowedVariableId, [...allowedVariableIds]));
           return emptyRendered();
         }
         const text = generated.text;
@@ -1671,9 +1677,15 @@ class Runtime {
     this.attachRuntimeError(context, this.missingVariableError(context.flow, variableId, explicitScope));
   }
 
-  private missingVariableError(flow: FlowVersion, variableId: string, explicitScope?: VariableScope): RuntimeError {
+  private missingVariableError(flow: FlowVersion, variableId: string, explicitScope?: VariableScope): MissingVariableReferenceRuntimeError {
     const scope = this.variableScope(flow, variableId, explicitScope);
-    return this.runtimeError("missing_variable_reference", `Variable ${variableId} was not found.`, false, { variableId, scope });
+    return {
+      code: "missing_variable_reference",
+      message: `Variable ${variableId} was not found.`,
+      recoverable: false,
+      variableId,
+      scope,
+    };
   }
 
   private variableScope(flow: FlowVersion, variableId: string, explicit?: VariableScope): VariableScope {
@@ -1816,7 +1828,7 @@ class Runtime {
     };
   }
 
-  private fail(context: TurnContext, code: string, message: string, recoverable: boolean): Promise<ProcessTurnResult> {
+  private fail(context: TurnContext, code: OperationalRuntimeErrorCode, message: string, recoverable: boolean): Promise<ProcessTurnResult> {
     this.attachError(context, code, message, recoverable);
     context.state.status = recoverable ? context.state.status : "failed";
     if (!recoverable) context.conversation.status = "failed";
@@ -1830,12 +1842,13 @@ class Runtime {
     return this.commit(context);
   }
 
-  private attachError(context: TurnContext, code: string, message: string, recoverable: boolean, details: Record<string, unknown> = {}): void {
+  private attachError(context: TurnContext, code: OperationalRuntimeErrorCode, message: string, recoverable: boolean, details: Record<string, unknown> = {}): void {
     this.attachRuntimeError(context, this.runtimeError(code, message, recoverable, details));
   }
 
   private attachRuntimeError(context: TurnContext, error: RuntimeError): void {
-    const { code, message, recoverable, ...details } = error as RuntimeError & Record<string, unknown>;
+    const { code, message, recoverable } = error;
+    const details = runtimeErrorMetadata(error);
     context.error = error;
     if (!recoverable) {
       context.state.status = "failed";
@@ -1845,8 +1858,18 @@ class Runtime {
     context.fragments.push({ source: "error", data: { code, message, recoverable, ...details } });
   }
 
-  private runtimeError(code: string, message: string, recoverable: boolean, details: Record<string, unknown> = {}): RuntimeError {
-    return { code, message, recoverable, ...details } as RuntimeError;
+  private runtimeError(code: OperationalRuntimeErrorCode, message: string, recoverable: boolean, details: Record<string, unknown> = {}): OperationalRuntimeError {
+    return { ...details, code, message, recoverable };
+  }
+
+  private invalidGeneratedResponseVariableError(variableId: string, allowedVariableIds: string[]): InvalidGeneratedResponseVariableRuntimeError {
+    return {
+      code: "invalid_generated_response_variable",
+      message: `Generated response used undeclared variable ${variableId}.`,
+      recoverable: false,
+      variableId,
+      allowedVariableIds,
+    };
   }
 
   private event(context: TurnContext, type: ConversationEventType, payload: Record<string, unknown> = {}): ConversationEvent {
@@ -2001,4 +2024,73 @@ class Runtime {
       error: result.error,
     };
   }
+}
+
+function runtimeErrorMetadata(error: RuntimeError): Record<string, unknown> {
+  let metadata: Record<string, unknown>;
+  switch (error.code) {
+    case "missing_step_handler":
+      metadata = { stepType: error.stepType };
+      break;
+    case "missing_operation_handler":
+      metadata = { operationType: error.operationType };
+      break;
+    case "missing_action_handler":
+      metadata = { actionKind: error.actionKind };
+      break;
+    case "missing_response_reference":
+      metadata = { responseId: error.responseId };
+      break;
+    case "missing_action_reference":
+      metadata = { actionId: error.actionId };
+      break;
+    case "missing_variable_reference":
+      metadata = {
+        variableId: error.variableId,
+        ...(error.scope === undefined ? {} : { scope: error.scope }),
+      };
+      break;
+    case "missing_flow_version":
+      metadata = { flowVersionId: error.flowVersionId };
+      break;
+    case "missing_step_target":
+      metadata = { stepId: error.stepId };
+      break;
+    case "missing_semantic_input_resolver":
+      metadata = error.taskId === undefined ? {} : { taskId: error.taskId };
+      break;
+    case "missing_llm_response_generator":
+      metadata = error.responseId === undefined ? {} : { responseId: error.responseId };
+      break;
+    case "missing_custom_operation_contract":
+      metadata = { customOperationId: error.customOperationId };
+      break;
+    case "missing_custom_operation_handler":
+      metadata = { customType: error.customType };
+      break;
+    case "invalid_semantic_outcome":
+      metadata = { outcome: error.outcome, allowedOutcomes: error.allowedOutcomes };
+      break;
+    case "invalid_semantic_variable":
+    case "invalid_generated_response_variable":
+      metadata = { variableId: error.variableId, allowedVariableIds: error.allowedVariableIds };
+      break;
+    case "model_validation_failed":
+      metadata = { issues: error.issues };
+      break;
+    case "unhandled_runtime_error":
+      metadata = {};
+      break;
+    default:
+      return operationalRuntimeErrorMetadata(error);
+  }
+  return error.details === undefined ? metadata : { ...metadata, details: error.details };
+}
+
+function operationalRuntimeErrorMetadata(error: OperationalRuntimeError): Record<string, unknown> {
+  const metadata: Record<string, unknown> = { ...error };
+  delete metadata.code;
+  delete metadata.message;
+  delete metadata.recoverable;
+  return metadata;
 }
