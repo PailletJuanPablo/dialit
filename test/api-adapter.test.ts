@@ -3,6 +3,8 @@ import {
   createConversationApi,
   createConversationEngine,
   type AttachmentInput,
+  type ConversationApiHttpResponse,
+  type ConversationApiVariable,
   type ConversationEventEnvelope,
   type FlowVersion,
 } from "../src/index";
@@ -115,7 +117,7 @@ describe("API integration helpers", () => {
     });
     expect(email.statusCode).toBe(200);
     expect(email.body.status).toBe("completed");
-    expect(email.body.variables.email.value).toBe("agent@example.com");
+    expect(apiVariable(email, "email").value).toBe("agent@example.com");
     expect(email.body.events.map((event) => event.type)).toEqual(expect.arrayContaining(["input_resolved", "variable_set"]));
 
     await api.start({ conversationId: "conversation-attachment-api", flowVersionId: FLOW_VERSION_ID });
@@ -127,7 +129,7 @@ describe("API integration helpers", () => {
       receivedAt: NOW,
     });
     expect(attachment.body.status).toBe("completed");
-    expect(attachment.body.variables.file.value).toMatchObject({ filename: "signed.pdf" });
+    expect(apiVariable(attachment, "file").value).toMatchObject({ filename: "signed.pdf" });
 
     await api.start({ conversationId: "conversation-event-api", flowVersionId: FLOW_VERSION_ID });
     await api.selectOption({ conversationId: "conversation-event-api", optionId: "event" });
@@ -139,7 +141,7 @@ describe("API integration helpers", () => {
       receivedAt: NOW,
     });
     expect(event.body.status).toBe("completed");
-    expect(event.body.variables.eventName.value).toBe("payment_confirmed");
+    expect(apiVariable(event, "eventName").value).toBe("payment_confirmed");
   });
 
   it("converts runtime errors into non-OK endpoint DTOs", async () => {
@@ -282,6 +284,15 @@ function attachmentInput(): AttachmentInput {
     mimeType: "application/pdf",
     sizeBytes: 1200,
   };
+}
+
+function apiVariable(response: ConversationApiHttpResponse, variableId: string): ConversationApiVariable {
+  const variable = response.body.variables[variableId];
+  if (variable === undefined) {
+    throw new Error(`Expected API variable '${variableId}' to exist.`);
+  }
+
+  return variable;
 }
 
 function deterministicIds() {

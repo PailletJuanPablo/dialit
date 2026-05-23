@@ -5,13 +5,13 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const TEMP_ROOT = mkdtempSync(join(tmpdir(), "nexembot-package-"));
+const TEMP_ROOT = mkdtempSync(join(tmpdir(), "dialit-package-"));
 const PACKAGE_DIRECTORY = join(TEMP_ROOT, "package");
 const CONSUMER_DIRECTORY = join(TEMP_ROOT, "consumer");
 const NODE_COMMAND = process.execPath;
 const NPM_CLI_PATH = process.env.npm_execpath ?? join(dirname(NODE_COMMAND), "node_modules", "npm", "bin", "npm-cli.js");
 const TSC_CLI_PATH = join(PROJECT_ROOT, "node_modules", "typescript", "bin", "tsc");
-const PACKAGE_NAME = "nexembot";
+const PACKAGE_NAME = "dialit";
 const NOW = "2026-05-22T12:00:00.000Z";
 
 try {
@@ -43,13 +43,15 @@ function packLibrary() {
     throw new Error(`npm pack returned an invalid package entry: ${JSON.stringify(entry)}`);
   }
 
+  assertPackageContents(entry);
+
   return resolve(PACKAGE_DIRECTORY, entry.filename);
 }
 
 function createConsumerProject(tarballPath) {
   mkdirSync(CONSUMER_DIRECTORY, { recursive: true });
   writeJsonFile(join(CONSUMER_DIRECTORY, "package.json"), {
-    name: "nexembot-package-consumer",
+    name: "dialit-package-consumer",
     private: true,
     type: "module",
   });
@@ -239,7 +241,41 @@ function runNodeAndCapture(scriptPath, args, cwd) {
 function isPackedPackage(value) {
   return typeof value === "object"
     && value !== null
-    && typeof value.filename === "string";
+    && typeof value.filename === "string"
+    && Array.isArray(value.files);
+}
+
+function assertPackageContents(entry) {
+  const paths = entry.files.map((file) => file.path);
+  const requiredPaths = [
+    "README.md",
+    "package.json",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/runtime-support.js",
+    "dist/runtime-support.d.ts",
+  ];
+  const forbiddenPaths = [
+    ".superpowers/",
+    "docs/",
+    "examples/",
+    "scripts/",
+    "site/",
+    "nexembot.md",
+    "types.ts",
+  ];
+
+  for (const path of requiredPaths) {
+    if (!paths.includes(path)) {
+      throw new Error(`Packed package is missing required file: ${path}`);
+    }
+  }
+
+  for (const path of paths) {
+    if (forbiddenPaths.some((forbiddenPath) => path === forbiddenPath || path.startsWith(forbiddenPath))) {
+      throw new Error(`Packed package includes forbidden file: ${path}`);
+    }
+  }
 }
 
 function removeTempDirectory(directory) {

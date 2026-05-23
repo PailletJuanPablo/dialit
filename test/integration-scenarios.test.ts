@@ -1,16 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createConversationEngine,
+  type AttachmentInput,
+  type AttachmentRules,
+  type AttachmentStepDefinition,
   type Conversation,
   type ConversationEngine,
   type ConversationEngineModule,
   type ConversationEngineRepositories,
   type ConversationEvent,
+  type ConversationFlowDefinition,
+  type ConversationStatus,
   type ConversationState,
   type DecisionTrace,
+  type FlowCallStatus,
   type FlowVersion,
+  type InputStepDefinition,
+  type MenuOption,
+  type MenuStepDefinition,
+  type MessageStepDefinition,
   type ProcessTurnResult,
+  type ResponsePlan,
+  type StepBranch,
+  type StepOperation,
+  type StepRoute,
+  type StepTarget,
   type UserInput,
+  type ValidatorDefinition,
+  type ValueExpression,
+  type VariableDefinition,
+  type VariableScope,
+  type VariableType,
+  type VariableValueSource,
 } from "../src/index";
 
 const NOW = "2026-05-22T12:00:00.000Z";
@@ -18,7 +39,26 @@ const SUPPORT_FLOW_VERSION_ID = "integrated-support-v1";
 const IDENTITY_FLOW_VERSION_ID = "integrated-identity-v1";
 const HANDOFF_CHILD_FLOW_VERSION_ID = "integrated-handoff-child-v1";
 
-describe("Nexembot integrated production-like scenarios", () => {
+type FlowDefinitionFixture =
+  & Pick<ConversationFlowDefinition, "flowId" | "startStepId" | "steps">
+  & Partial<Omit<ConversationFlowDefinition, "flowId" | "startStepId" | "steps">>;
+
+type MessageStepOptions = Omit<Partial<MessageStepDefinition>, "stepId" | "type" | "config"> & {
+  autoAdvance?: boolean;
+};
+
+interface InputStepOptions {
+  validators?: ValidatorDefinition[];
+  invalidMessage?: string;
+  routes?: StepRoute[];
+}
+
+interface AttachmentStepOptions extends Pick<AttachmentRules, "allowedMimeTypes" | "allowedExtensions" | "maxSizeMb"> {
+  invalidMessage: string;
+  routes?: StepRoute[];
+}
+
+describe("Dialit integrated production-like scenarios", () => {
   it("runs a technical support journey across persisted turns with child identity, action, attachment, custom operation, generated response, events, and traces", async () => {
     const repositories = trackingRepositories([
       integratedSupportFlow(),
@@ -207,7 +247,7 @@ describe("Nexembot integrated production-like scenarios", () => {
     );
   });
 
-  it.each([
+  it.each<[FlowCallStatus, string]>([
     ["cancelled", "The child flow was cancelled."],
     ["failed", "The child flow failed in a controlled way."],
   ])("routes a called flow %s result through parent status branches", async (terminalStatus, expectedMessage) => {
@@ -373,6 +413,7 @@ function integratedSupportFlow(): FlowVersion {
           {
             type: "custom",
             operationId: "create_ticket",
+            customOperationId: "create_ticket",
             customType: "create_support_ticket",
             inputMapping: {
               dni: variableRef("verifiedDni"),
@@ -391,7 +432,7 @@ function integratedSupportFlow(): FlowVersion {
       messageStep("ticket_response", [
         {
           mode: "generated",
-          prompt: "Write a concise ticket confirmation.",
+          goal: "Write a concise ticket confirmation.",
           allowedVariableIds: ["ticketId", "customerTier"],
           fallbackText: "Your ticket was created.",
         },
@@ -465,8 +506,8 @@ function handoffChildFlow(): FlowVersion {
           {
             type: "handoff",
             operationId: "child_handoff",
-            queueId: "specialists",
-            saveHandoffIdToVariableId: "handoffId",
+            queue: "specialists",
+            handoffIdVariableId: "handoffId",
             message: staticText("A specialist will continue this conversation."),
             onResult: [
               {
@@ -481,7 +522,7 @@ function handoffChildFlow(): FlowVersion {
   });
 }
 
-function parentWithTerminalChildFlow(status: string): FlowVersion {
+function parentWithTerminalChildFlow(status: FlowCallStatus): FlowVersion {
   return flowVersion(`parent-${status}-v1`, {
     flowId: `parent-${status}`,
     startStepId: "call_child",
@@ -513,7 +554,7 @@ function parentWithTerminalChildFlow(status: string): FlowVersion {
   });
 }
 
-function terminalChildFlow(status: string): FlowVersion {
+function terminalChildFlow(status: FlowCallStatus): FlowVersion {
   return flowVersion(`child-${status}-v1`, {
     flowId: `child-${status}`,
     startStepId: "terminal",
@@ -526,41 +567,48 @@ function terminalChildFlow(status: string): FlowVersion {
   });
 }
 
-function flowVersion(flowVersionId: string, definition: Record<string, unknown>): FlowVersion {
+function flowVersion(flowVersionId: string, definition: FlowDefinitionFixture): FlowVersion {
+  const completeDefinition: ConversationFlowDefinition = {
+    variables: [],
+    actions: [],
+    responses: [],
+    settings: { maxStepExecutionsPerTurn: 30 },
+    ...definition,
+  };
+
   return {
     flowVersionId,
-    flowId: definition.flowId as string,
+    flowId: definition.flowId,
     version: "1.0.0",
     status: "published",
     schemaVersion: "0.1",
     createdAt: NOW,
-    definition: {
-      variables: [],
-      actions: [],
-      responses: [],
-      settings: { maxStepExecutionsPerTurn: 30 },
-      ...definition,
-    },
-  } as FlowVersion;
+    definition: completeDefinition,
+  };
 }
 
-function variable(variableId: string, type: string, scope: string) {
+function variable(variableId: string, type: VariableType, scope: VariableScope): VariableDefinition {
   return { variableId, type, scope };
 }
 
-function messageStep(stepId: string, messages: Array<string | Record<string, unknown>>, options: Record<string, unknown> = {}) {
+function messageStep(
+  stepId: string,
+  messages: Array<string | ResponsePlan>,
+  options: MessageStepOptions = {},
+): MessageStepDefinition {
+  const { autoAdvance = true, ...stepOptions } = options;
   return {
     stepId,
     type: "message",
     config: {
       messages: messages.map((message) => (typeof message === "string" ? staticText(message) : message)),
-      autoAdvance: true,
+      autoAdvance,
     },
-    ...options,
+    ...stepOptions,
   };
 }
 
-function menuStep(stepId: string, prompt: string, options: Array<Record<string, unknown>>) {
+function menuStep(stepId: string, prompt: string, options: MenuOption[]): MenuStepDefinition {
   return {
     stepId,
     type: "menu",
@@ -582,12 +630,17 @@ function menuStep(stepId: string, prompt: string, options: Array<Record<string, 
   };
 }
 
-function inputStep(stepId: string, prompt: string, targetVariableId: string, options: Record<string, unknown> = {}) {
-  const { validators = [], invalidMessage = "Please send a valid value.", routes = [] } = options as {
-    validators?: unknown[];
-    invalidMessage?: string;
-    routes?: unknown[];
-  };
+function inputStep(
+  stepId: string,
+  prompt: string,
+  targetVariableId: string,
+  options: InputStepOptions = {},
+): InputStepDefinition {
+  const {
+    validators = [],
+    invalidMessage = "Please send a valid value.",
+    routes = [],
+  } = options;
 
   return {
     stepId,
@@ -618,7 +671,12 @@ function inputStep(stepId: string, prompt: string, targetVariableId: string, opt
   };
 }
 
-function attachmentStep(stepId: string, prompt: string, targetVariableId: string, options: Record<string, unknown>) {
+function attachmentStep(
+  stepId: string,
+  prompt: string,
+  targetVariableId: string,
+  options: AttachmentStepOptions,
+): AttachmentStepDefinition {
   return {
     stepId,
     type: "attachment",
@@ -640,7 +698,7 @@ function attachmentStep(stepId: string, prompt: string, targetVariableId: string
   };
 }
 
-function option(optionId: string, label: string, aliases: string[], branchValue: unknown) {
+function option(optionId: string, label: string, aliases: string[], branchValue: StepBranch): MenuOption {
   return {
     optionId,
     label,
@@ -652,11 +710,11 @@ function option(optionId: string, label: string, aliases: string[], branchValue:
 
 let branchCounter = 0;
 
-function branch(value: Record<string, unknown>) {
+function branch(value: Omit<StepBranch, "branchId">): StepBranch {
   return { branchId: `integration-branch-${++branchCounter}`, ...value };
 }
 
-function route(outcome: string, branchValue: unknown) {
+function route(outcome: string, branchValue: StepBranch): StepRoute {
   return {
     routeId: `route-${outcome}`,
     match: { type: "outcome", outcome },
@@ -664,11 +722,11 @@ function route(outcome: string, branchValue: unknown) {
   };
 }
 
-function staticText(text: string) {
+function staticText(text: string): ResponsePlan {
   return { mode: "static", text };
 }
 
-function setVariable(variableId: string, value: unknown, source: string) {
+function setVariable(variableId: string, value: unknown, source: VariableValueSource): StepOperation {
   return {
     type: "set_variable",
     variableId,
@@ -677,19 +735,19 @@ function setVariable(variableId: string, value: unknown, source: string) {
   };
 }
 
-function stepTarget(stepId: string) {
+function stepTarget(stepId: string): StepTarget {
   return { type: "step", stepId };
 }
 
-function endTarget(status: string) {
+function endTarget(status: ConversationStatus): StepTarget {
   return { type: "end", status };
 }
 
-function literal(value: unknown) {
+function literal(value: unknown): ValueExpression {
   return { type: "literal", value };
 }
 
-function variableRef(variableId: string) {
+function variableRef(variableId: string): ValueExpression {
   return { type: "variable", variableId };
 }
 
@@ -703,14 +761,14 @@ function textInput(conversationId: string, text: string): UserInput {
   } as UserInput;
 }
 
-function attachmentInput(conversationId: string, attachments: Array<Record<string, unknown>>): UserInput {
+function attachmentInput(conversationId: string, attachments: AttachmentInput[]): UserInput {
   return {
     inputId: `input-${conversationId}-attachment-${attachments.length}`,
     conversationId,
     type: "attachment",
     attachments,
     receivedAt: NOW,
-  } as UserInput;
+  };
 }
 
 function texts(result: ProcessTurnResult) {

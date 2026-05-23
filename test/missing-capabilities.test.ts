@@ -2,14 +2,53 @@ import { describe, expect, it } from "vitest";
 import {
   createConversationEngine,
   validateFlowDefinition,
+  type AttachmentRules,
+  type AttachmentStepDefinition,
+  type AttachmentInput,
   type ConversationEngine,
   type ConversationEngineModule,
+  type ConversationFlowDefinition,
   type FlowVersion,
+  type GlobalCommandPolicy,
+  type InputBinding,
+  type InputStepDefinition,
+  type InputType,
+  type InvalidInputBehavior,
+  type JsonObject,
+  type MessageStepDefinition,
   type ProcessTurnResult,
+  type ResponsePlan,
+  type StepBranch,
+  type StepOperation,
+  type StepRoute,
+  type StepTarget,
   type UserInput,
+  type VariableDefinition,
+  type VariableType,
 } from "../src/index";
 
 const NOW = "2026-05-22T12:00:00.000Z";
+
+type FlowDefinitionFixture =
+  & Pick<ConversationFlowDefinition, "flowId" | "startStepId" | "variables" | "steps">
+  & Partial<Omit<ConversationFlowDefinition, "flowId" | "startStepId" | "variables" | "steps">>;
+
+type MessageStepOptions = Omit<Partial<MessageStepDefinition>, "stepId" | "type" | "config"> & {
+  autoAdvance?: boolean;
+};
+
+interface InputStepOptions {
+  acceptedInputTypes?: InputType[];
+  bindings?: InputBinding[];
+  globalCommands?: GlobalCommandPolicy;
+  routes?: StepRoute[];
+}
+
+interface AttachmentStepOptions {
+  rules: AttachmentRules;
+  invalidAttachment?: InvalidInputBehavior;
+  routes?: StepRoute[];
+}
 
 describe("documented missing capabilities", () => {
   it("processes multiple input bindings through normalizers, extractors, validators, and raw metadata", async () => {
@@ -314,7 +353,7 @@ function registeredOperationFlow(): FlowVersion {
     variables: [variable("auditStatus", "string")],
     steps: [
       messageStep("start", [], {
-        onEnter: [{ type: "registered_audit", operationId: "registered_audit_1" }],
+        onEnter: [{ type: "registered_audit", operationId: "registered_audit_1" } as unknown as StepOperation],
         routes: [route("next", branch({ target: stepTarget("done") }))],
       }),
       messageStep("done", ["Registered operation complete."]),
@@ -396,7 +435,7 @@ function validationContractFlow(): FlowVersion {
               },
             ],
           },
-          { type: "missing_registered_operation", operationId: "missing_registered_1" },
+          { type: "missing_registered_operation", operationId: "missing_registered_1" } as unknown as StepOperation,
         ],
       }),
       messageStep("action_branch", [], {
@@ -418,23 +457,23 @@ function validationContractFlow(): FlowVersion {
   });
 }
 
-function flowVersion(flowVersionId: string, definition: Record<string, unknown>): FlowVersion {
+function flowVersion(flowVersionId: string, definition: FlowDefinitionFixture): FlowVersion {
   return {
     flowVersionId,
-    flowId: String(definition.flowId),
+    flowId: definition.flowId,
     version: "1.0.0",
     status: "draft",
     schemaVersion: "0.1",
     createdAt: NOW,
-    definition: definition as FlowVersion["definition"],
+    definition,
   };
 }
 
-function variable(variableId: string, type: string) {
+function variable(variableId: string, type: VariableType): VariableDefinition {
   return { variableId, type, scope: "conversation" };
 }
 
-function inputStep(stepId: string, prompt: string, options: Record<string, unknown>) {
+function inputStep(stepId: string, prompt: string, options: InputStepOptions): InputStepDefinition {
   return {
     stepId,
     type: "input",
@@ -451,7 +490,12 @@ function inputStep(stepId: string, prompt: string, options: Record<string, unkno
   };
 }
 
-function attachmentStep(stepId: string, prompt: string, targetVariableId: string, options: Record<string, unknown>) {
+function attachmentStep(
+  stepId: string,
+  prompt: string,
+  targetVariableId: string,
+  options: AttachmentStepOptions,
+): AttachmentStepDefinition {
   return {
     stepId,
     type: "attachment",
@@ -465,22 +509,24 @@ function attachmentStep(stepId: string, prompt: string, targetVariableId: string
   };
 }
 
-function messageStep(stepId: string, messages: string[], options: Record<string, unknown> = {}) {
+function messageStep(stepId: string, messages: string[], options: MessageStepOptions = {}): MessageStepDefinition {
+  const { autoAdvance, ...stepOptions } = options;
   return {
     stepId,
     type: "message",
     config: {
       messages: messages.map(staticText),
+      ...(autoAdvance === undefined ? {} : { autoAdvance }),
     },
-    ...options,
+    ...stepOptions,
   };
 }
 
-function branch(value: Record<string, unknown>) {
+function branch(value: Omit<StepBranch, "branchId">): StepBranch {
   return value;
 }
 
-function route(outcome: string, branchValue: unknown) {
+function route(outcome: string, branchValue: StepBranch): StepRoute {
   return {
     routeId: `route-${outcome}`,
     match: { type: "outcome", outcome },
@@ -488,15 +534,15 @@ function route(outcome: string, branchValue: unknown) {
   };
 }
 
-function stepTarget(stepId: string) {
+function stepTarget(stepId: string): StepTarget {
   return { type: "step", stepId };
 }
 
-function endTarget(status: string) {
+function endTarget(status: "completed" | "handoff"): StepTarget {
   return { type: "end", status };
 }
 
-function staticText(text: string) {
+function staticText(text: string): ResponsePlan {
   return { mode: "static", text };
 }
 
@@ -510,7 +556,7 @@ function textInput(conversationId: string, text: string): UserInput {
   };
 }
 
-function eventInput(conversationId: string, eventType: string, payload: Record<string, unknown>): Extract<UserInput, { type: "event" }> {
+function eventInput(conversationId: string, eventType: string, payload: JsonObject): Extract<UserInput, { type: "event" }> {
   return {
     inputId: `input-${conversationId}-${eventType}`,
     conversationId,
@@ -521,14 +567,14 @@ function eventInput(conversationId: string, eventType: string, payload: Record<s
   };
 }
 
-function attachmentInput(conversationId: string, attachments: Array<Record<string, unknown>>): UserInput {
+function attachmentInput(conversationId: string, attachments: AttachmentInput[]): UserInput {
   return {
     inputId: `input-${conversationId}-attachment`,
     conversationId,
     type: "attachment",
     attachments,
     receivedAt: NOW,
-  } as Extract<UserInput, { type: "attachment" }>;
+  };
 }
 
 function texts(result: ProcessTurnResult): string[] {

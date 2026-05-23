@@ -1,24 +1,32 @@
-# Nexembot
+# Dialit
 
-Nexembot is a framework-agnostic TypeScript library for running versioned chatbot flows from structured definitions.
+Dialit is a framework-agnostic TypeScript engine for building conversational products from versioned flow definitions.
 
-It is designed for code agents and humans who need transparent behavior:
+It keeps the runtime explicit: every step, route, variable write, operation, emitted event, and decision trace is represented as typed data. Applications bring their own HTTP layer, persistence, UI, and LLM provider; Dialit runs the conversation contract and returns stable results that are easy to inspect, test, and persist.
 
-- flows are plain typed objects;
-- steps, variables, routes, actions, operations, events, and traces are explicit;
-- LLM usage is allowed only through declared input or response contracts;
-- asynchronous operations finish before state is updated;
-- state changes are persisted as events and decision traces.
+## Public Links
 
-## Install
+- Site: <https://pailletjuanpablo.github.io/dialit/>
+- npm: <https://www.npmjs.com/package/dialit>
+- Repository: <https://github.com/PailletJuanPablo/dialit>
+
+## Why Dialit
+
+- Versioned flows are plain TypeScript objects.
+- Runtime behavior is traceable through committed events and decision traces.
+- Async operations finish before state is advanced.
+- LLM usage is declared through explicit contracts instead of hidden fallbacks.
+- The same engine can run behind Express, Fastify, serverless handlers, queues, or local tests.
+
+## Installation
 
 ```sh
-npm install nexembot
+npm install dialit
 ```
 
-Nexembot is published as an ESM package and requires Node.js 20 or newer.
+Dialit is ESM-only and requires Node.js 20 or newer.
 
-## Public Entry Points
+## Package Entry Points
 
 ```ts
 import {
@@ -26,7 +34,7 @@ import {
   createConversationEngine,
   validateFlowDefinition,
   type FlowVersion,
-} from "nexembot";
+} from "dialit";
 
 import {
   InMemoryConversationRepository,
@@ -34,29 +42,29 @@ import {
   InMemoryConversationEventRepository,
   InMemoryDecisionTraceRepository,
   InMemoryFlowVersionRepository,
-} from "nexembot/runtime-support";
+} from "dialit/runtime-support";
 ```
 
-Use the root entry point for runtime APIs and public contracts. Use `nexembot/runtime-support` for simple in-memory repositories and runtime helpers used by tests, examples, and local prototypes.
+Use `dialit` for the engine, API adapter, validation, and public contracts. Use `dialit/runtime-support` for simple in-memory repositories and default runtime helpers in tests or prototypes.
 
-## Minimal Flow
+## Quick Start
 
 ```ts
 import {
-  createConversationEngine,
+  createConversationApi,
   validateFlowDefinition,
   type FlowVersion,
-} from "nexembot";
+} from "dialit";
 
 const flowVersion: FlowVersion = {
-  flowVersionId: "hello-flow-v1",
-  flowId: "hello-flow",
+  flowVersionId: "support-v1",
+  flowId: "support",
   version: "1.0.0",
   status: "draft",
   schemaVersion: "0.1",
   createdAt: "2026-05-22T12:00:00.000Z",
   definition: {
-    flowId: "hello-flow",
+    flowId: "support",
     startStepId: "welcome",
     variables: [],
     steps: [
@@ -64,11 +72,11 @@ const flowVersion: FlowVersion = {
         stepId: "welcome",
         type: "message",
         config: {
-          messages: [{ mode: "static", text: "Welcome to Nexembot." }],
+          messages: [{ mode: "static", text: "How can we help?" }],
         },
         routes: [
           {
-            routeId: "welcome-end",
+            routeId: "finish",
             match: { type: "outcome", outcome: "next" },
             branch: { target: { type: "end", status: "completed" } },
           },
@@ -83,71 +91,64 @@ if (!report.valid) {
   throw new Error(report.issues.map((issue) => issue.message).join("\n"));
 }
 
+const api = createConversationApi({
+  flowVersions: [flowVersion],
+});
+
+const response = await api.start({
+  conversationId: "conversation-1",
+  flowVersionId: "support-v1",
+  channel: "web",
+});
+
+console.log(response.statusCode);
+console.log(response.body.messages[0]?.text);
+```
+
+`createConversationApi` returns transport-neutral HTTP-style responses. Your application decides how those responses map to routes, controllers, workers, or UI state.
+
+## Engine Usage
+
+Use the lower-level engine when you want direct access to runtime results.
+
+```ts
+import { createConversationEngine } from "dialit";
+
 const engine = createConversationEngine({
   flowVersions: [flowVersion],
 });
 
 const result = await engine.startConversation({
-  conversationId: "conversation-1",
-  flowVersionId: "hello-flow-v1",
+  conversationId: "conversation-2",
+  flowVersionId: "support-v1",
 });
 
-console.log(result.messages.map((message) => message.content));
+for (const event of result.events) {
+  console.log(event.type);
+}
+
+console.log(result.trace.decisions);
 ```
 
-## API-Friendly Usage
-
-`createConversationApi` wraps the engine with transport-agnostic request and response objects. This is intended for Express, Fastify, serverless functions, queues, or any other API layer.
+The engine exposes event subscriptions after events are persisted:
 
 ```ts
-import { createConversationApi } from "nexembot";
-
-const api = createConversationApi({
-  flowVersions: [flowVersion],
-});
-
-const startResponse = await api.start({
-  conversationId: "conversation-1",
-  flowVersionId: "hello-flow-v1",
-  channel: "web",
-});
-
-const messageResponse = await api.sendMessage({
-  conversationId: "conversation-1",
-  text: "hello",
-});
-```
-
-The adapter does not own HTTP routing. It returns stable DTOs that an application can map to endpoints.
-
-## Events
-
-The engine exposes committed conversation events through a minimal subscription API.
-
-```ts
-const engine = createConversationEngine({
-  flowVersions: [flowVersion],
-});
-
 const subscription = engine.subscribeToEvents((envelope) => {
   console.log(envelope.event.type, envelope.result.state.status);
-});
-
-await engine.startConversation({
-  conversationId: "conversation-events",
-  flowVersionId: "hello-flow-v1",
 });
 
 subscription.unsubscribe();
 ```
 
-Subscribers run after events are persisted. Subscriber failures are not swallowed.
+Subscriber failures are not swallowed, so integration errors remain visible.
 
-## Repository Integration
+## Persistence
 
-Production applications should provide repository implementations for persistence.
+Prototype code can use the in-memory repositories from `dialit/runtime-support`. Production applications should provide durable repository implementations.
 
 ```ts
+import { createConversationEngine } from "dialit";
+
 const engine = createConversationEngine({
   repositories: {
     flowVersions,
@@ -159,20 +160,24 @@ const engine = createConversationEngine({
 });
 ```
 
-The in-memory repositories in `nexembot/runtime-support` are useful for local tests and examples, but they are not durable storage.
+Dialit does not prescribe a database. Repository implementations can target SQL, document stores, event stores, or application-specific persistence.
 
-## Documentation Map
+## Package Contents
 
-- `docs/flow-authoring.md`: how to create flows, steps, routes, variables, actions, operations, LLM contracts, and handoff.
-- `docs/api-integration.md`: how to integrate the engine behind API endpoints and event subscribers.
-- `docs/web-chatbot-demo.md`: how to run the local web demo that consumes the library.
-- `src/types.ts`: authoritative public TypeScript contracts.
+The npm package intentionally publishes only:
 
-## Package Verification
+- `dist`
+- `README.md`
+- `package.json`
+
+Source files, tests, local scripts, generated site files, and internal planning material are kept out of the npm tarball.
+
+## Development
 
 ```sh
 npm run build
 npm test -- --run
+npm run typecheck:tests
 npm run test:package
 npm run pack:dry-run
 ```
