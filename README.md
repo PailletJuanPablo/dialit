@@ -6,7 +6,7 @@ It keeps the runtime explicit: every step, route, variable write, operation, emi
 
 ## Public Links
 
-- Site: <https://pailletjuanpablo.github.io/dialit/>
+- Site: <https://dialit.netlify.app/>
 - npm: <https://www.npmjs.com/package/dialit>
 - Repository: <https://github.com/PailletJuanPablo/dialit>
 

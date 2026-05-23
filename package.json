@@ -1,6 +1,6 @@
 {
   "name": "dialit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript conversational flow engine for versioned chatbot definitions.",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,7 +13,7 @@
   "bugs": {
     "url": "https://github.com/PailletJuanPablo/dialit/issues"
   },
-  "homepage": "https://pailletjuanpablo.github.io/dialit/",
+  "homepage": "https://dialit.netlify.app/",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

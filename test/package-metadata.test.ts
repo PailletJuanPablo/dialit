@@ -49,7 +49,7 @@ describe("package metadata", () => {
     expect(manifest.bugs).toEqual({
       url: "https://github.com/PailletJuanPablo/dialit/issues",
     });
-    expect(manifest.homepage).toBe("https://pailletjuanpablo.github.io/dialit/");
+    expect(manifest.homepage).toBe("https://dialit.netlify.app/");
     expect(manifest.exports).toEqual({
       ".": {
         types: "./dist/index.d.ts",

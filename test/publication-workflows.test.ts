@@ -12,6 +12,10 @@ function readRequiredFile(path: string) {
   return readFileSync(path, "utf8");
 }
 
+function expectFileMissing(path: string) {
+  expect(existsSync(path), `${path} should not exist`).toBe(false);
+}
+
 const manifest = JSON.parse(readFileSync("package.json", "utf8")) as PackageManifest;
 
 describe("public release configuration", () => {
@@ -20,33 +24,34 @@ describe("public release configuration", () => {
 
     expect(manifest.name).toBe("dialit");
     expect(manifest.private).not.toBe(true);
-    expect(manifest.homepage).toBe("https://pailletjuanpablo.github.io/dialit/");
+    expect(manifest.homepage).toBe("https://dialit.netlify.app/");
     expect(readme).toContain("npm install dialit");
   });
 
-  it("builds the Vite site for the GitHub Pages project path", () => {
+  it("builds the Vite site for a root-hosted static deployment", () => {
     const viteConfig = readRequiredFile("site/vite.config.ts");
     const routerSource = readRequiredFile("site/src/router.ts");
     const siteManifest = readRequiredFile("site/package.json");
 
-    expect(viteConfig).toContain('base: "/dialit/"');
+    expect(viteConfig).toContain('base: "/"');
     expect(routerSource).toContain("createWebHistory(import.meta.env.BASE_URL)");
-    expect(siteManifest).toContain('"build": "vue-tsc --noEmit && vite build && node scripts/copy-pages-spa-fallback.mjs"');
+    expect(siteManifest).toContain('"build": "vue-tsc --noEmit && vite build"');
+    expect(siteManifest).not.toContain("copy-pages-spa-fallback");
   });
 
-  it("defines the GitHub Pages deployment workflow", () => {
-    const workflow = readRequiredFile(".github/workflows/deploy-site.yml");
+  it("defines the Netlify static site deployment", () => {
+    const config = readRequiredFile("netlify.toml");
 
-    expect(workflow).toContain("name: Deploy site to GitHub Pages");
-    expect(workflow).toContain("branches: [master]");
-    expect(workflow).toContain("uses: actions/configure-pages@v5");
-    expect(workflow).toContain("uses: actions/upload-pages-artifact@v4");
-    expect(workflow).toContain("path: site/dist");
-    expect(workflow).toContain("uses: actions/deploy-pages@v4");
-    expect(workflow).toContain("pages: write");
-    expect(workflow).toContain("id-token: write");
-    expect(workflow).toContain("npm ci --prefix site");
-    expect(workflow).toContain("npm run site:build");
+    expectFileMissing(".github/workflows/deploy-site.yml");
+    expect(config).toContain('[build]');
+    expect(config).toContain('command = "npm ci --prefix site && npm run site:build"');
+    expect(config).toContain('publish = "site/dist"');
+    expect(config).toContain('[build.environment]');
+    expect(config).toContain('NODE_VERSION = "20"');
+    expect(config).toContain('[[redirects]]');
+    expect(config).toContain('from = "/*"');
+    expect(config).toContain('to = "/index.html"');
+    expect(config).toContain('status = 200');
   });
 
   it("defines the npm publication workflow", () => {
