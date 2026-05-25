@@ -1,7 +1,8 @@
 {
   "name": "dialit",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "TypeScript conversational flow engine for versioned chatbot definitions.",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -34,7 +35,18 @@
     "conversation",
     "workflow",
     "typescript",
-    "llm"
+    "llm",
+    "language model",
+    "dialogue",
+    "flow engine",
+    "state machine",
+    "chats",
+    "conversational ai",
+    "flow management",
+    "dialogue management",
+    "conversation design",
+    "dialogue flow",
+    "state management"
   ],
   "files": [
     "dist",

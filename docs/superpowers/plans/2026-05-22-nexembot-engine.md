@@ -1,8 +1,8 @@
-# Nexembot Engine Implementation Plan
+# Dialit Engine Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the v0.1 TypeScript conversational flow engine described by `nexembot.md`.
+**Goal:** Build the v0.1 TypeScript conversational flow engine described by `dialit.md`.
 
 **Architecture:** A plain TypeScript library with a small public facade, immutable turn processing, registries for extensibility, in-memory persistence, scoped variables with history, built-in step handlers, built-in operation handlers, and trace-first results. Handlers return patches and events; the reducer commits state only after async work completes.
 

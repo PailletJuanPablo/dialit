@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a minimal event subscription API and framework-agnostic endpoint helpers for Nexembot consumers.
+**Goal:** Add a minimal event subscription API and framework-agnostic endpoint helpers for Dialit consumers.
 
 **Architecture:** Keep the core runtime dependency-free. `ConversationEngine` exposes `subscribeToEvents`, and a new `api-adapter` module wraps engine calls into endpoint-friendly request methods and response DTOs.
 
-**Tech Stack:** TypeScript strict mode, Vitest, existing Nexembot runtime.
+**Tech Stack:** TypeScript strict mode, Vitest, existing Dialit runtime.
 
 ---
 

@@ -1,12 +1,12 @@
 # Flow Authoring Guide
 
-This guide explains how to create Nexembot flows from structured TypeScript definitions.
+This guide explains how to create Dialit flows from structured TypeScript definitions.
 
 The authoritative public contracts live in `src/types.ts` and are exported from `src/index.ts`. The root-level `types.ts` is a historical reference snapshot, not the runtime-facing source of truth.
 
 ## Mental Model
 
-A Nexembot flow is a versioned state machine for a conversation.
+A Dialit flow is a versioned state machine for a conversation.
 
 - A `FlowVersion` wraps a `ConversationFlowDefinition`.
 - A flow starts at `startStepId`.
@@ -35,7 +35,7 @@ Use this order when creating a new flow:
 ## Minimal Flow Version
 
 ```ts
-import type { FlowVersion } from "nexembot";
+import type { FlowVersion } from "dialit";
 
 const supportFlowVersion: FlowVersion = {
   flowVersionId: "support-v1",
@@ -760,7 +760,7 @@ Use traces for debugging decisions. Use events for integrations, analytics, and 
 Validate definitions before publishing or running them.
 
 ```ts
-import { validateFlowDefinition } from "nexembot";
+import { validateFlowDefinition } from "dialit";
 
 const report = validateFlowDefinition(supportFlowVersion.definition, {
   registeredStepTypes: ["appointment_scheduler"],
@@ -819,7 +819,7 @@ import {
   validateFlowDefinition,
   type ConversationFlowDefinition,
   type FlowVersion,
-} from "nexembot";
+} from "dialit";
 
 const definition: ConversationFlowDefinition = {
   flowId: "support",

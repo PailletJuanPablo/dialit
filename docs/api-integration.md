@@ -1,6 +1,6 @@
 # API Integration
 
-Nexembot exposes two small integration surfaces for backend APIs:
+Dialit exposes two small integration surfaces for backend APIs:
 
 - `engine.subscribeToEvents(...)` for minimal event subscriptions.
 - `createConversationApi(...)` for framework-agnostic endpoint helpers.
@@ -10,7 +10,7 @@ These helpers do not depend on Express, Fastify, Next.js, or any HTTP runtime.
 ## Event Subscription
 
 ```ts
-import { createConversationEngine } from "nexembot";
+import { createConversationEngine } from "dialit";
 
 const engine = createConversationEngine({ flowVersions });
 
@@ -43,7 +43,7 @@ const engine = createConversationEngine({
 `createConversationApi` wraps the engine with endpoint-friendly methods and returns plain DTOs.
 
 ```ts
-import { createConversationApi } from "nexembot";
+import { createConversationApi } from "dialit";
 
 const api = createConversationApi({ flowVersions });
 

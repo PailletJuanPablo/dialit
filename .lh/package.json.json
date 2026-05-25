@@ -1,0 +1,22 @@
+{
+    "sourceFile": "package.json",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 1,
+            "patches": [
+                {
+                    "date": 1779696932002,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1779697046620,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -34,14 +34,24 @@\n     \"chatbot\",\n     \"conversation\",\n     \"workflow\",\n     \"typescript\",\n-    \"llm\"\n+    \"llm\",\n+    \"language model\",\n+    \"dialogue\",\n+    \"flow engine\",\n+    \"state machine\",\n+    \"chats\",\n+    \"conversational ai\",\n+    \"flow management\",\n+    \"dialogue management\",\n+    \"conversation design\",\n+    \"dialogue flow\",\n+    \"state management\"\n   ],\n   \"files\": [\n     \"dist\",\n-    \"README.md\",\n-    \"LICENSE\"\n+    \"README.md\"\n   ],\n   \"scripts\": {\n     \"build\": \"tsc -p tsconfig.json\",\n     \"typecheck:tests\": \"tsc -p tsconfig.test.json\",\n"
+                }
+            ],
+            "date": 1779696932002,
+            "name": "Commit-0",
+            "content": "{\n  \"name\": \"dialit\",\n  \"version\": \"1.0.0\",\n  \"description\": \"TypeScript conversational flow engine for versioned chatbot definitions.\",\n  \"license\": \"MIT\",\n  \"type\": \"module\",\n  \"main\": \"./dist/index.js\",\n  \"module\": \"./dist/index.js\",\n  \"types\": \"./dist/index.d.ts\",\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/PailletJuanPablo/dialit.git\"\n  },\n  \"bugs\": {\n    \"url\": \"https://github.com/PailletJuanPablo/dialit/issues\"\n  },\n  \"homepage\": \"https://dialit.netlify.app/\",\n  \"exports\": {\n    \".\": {\n      \"types\": \"./dist/index.d.ts\",\n      \"import\": \"./dist/index.js\"\n    },\n    \"./runtime-support\": {\n      \"types\": \"./dist/runtime-support.d.ts\",\n      \"import\": \"./dist/runtime-support.js\"\n    },\n    \"./package.json\": \"./package.json\"\n  },\n  \"sideEffects\": false,\n  \"engines\": {\n    \"node\": \">=20\"\n  },\n  \"keywords\": [\n    \"chatbot\",\n    \"conversation\",\n    \"workflow\",\n    \"typescript\",\n    \"llm\"\n  ],\n  \"files\": [\n    \"dist\",\n    \"README.md\",\n    \"LICENSE\"\n  ],\n  \"scripts\": {\n    \"build\": \"tsc -p tsconfig.json\",\n    \"typecheck:tests\": \"tsc -p tsconfig.test.json\",\n    \"test\": \"vitest run\",\n    \"test:package\": \"node scripts/package-smoke-test.mjs\",\n    \"pack:dry-run\": \"npm pack --dry-run\",\n    \"prepack\": \"npm run build\",\n    \"site:dev\": \"npm --prefix site run dev -- --port 5173\",\n    \"site:build\": \"npm --prefix site run build\",\n    \"site:preview\": \"npm --prefix site run preview -- --port 4173\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"^20.14.12\",\n    \"typescript\": \"^5.5.4\",\n    \"vitest\": \"^2.0.5\"\n  }\n}\n"
+        }
+    ]
+}

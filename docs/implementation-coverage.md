@@ -1,6 +1,6 @@
-# Nexembot v0.1 implementation coverage
+# Dialit v0.1 implementation coverage
 
-This document maps the requirements described in `nexembot.md` to the current TypeScript implementation. It also records detected gaps so future work can target concrete missing capabilities instead of relying on broad assumptions.
+This document maps the requirements described in `dialit.md` to the current TypeScript implementation. It also records detected gaps so future work can target concrete missing capabilities instead of relying on broad assumptions.
 
 ## Status legend
 
@@ -10,7 +10,7 @@ This document maps the requirements described in `nexembot.md` to the current Ty
 
 ## Source of truth checked
 
-- Documentation: `nexembot.md`
+- Documentation: `dialit.md`
 - Original high-level type reference: root `types.ts`
 - Package implementation contracts: `src/types.ts`
 - Runtime: `src/runtime.ts`
@@ -39,7 +39,7 @@ Important note: the package exports `src/types.ts` through `src/index.ts`. The r
 
 ## Section-by-section mapping
 
-| `nexembot.md` section | Status | Implemented in | Evidence / gaps |
+| `dialit.md` section | Status | Implemented in | Evidence / gaps |
 |---|---:|---|---|
 | 01. Vision general | Implemented | `createConversationEngine`, `startConversation`, `processUserInput`, built-in steps, operations, events, trace | The runtime executes versioned flows, deterministic and LLM-assisted paths, and returns state/messages/events/trace. Reference and integration tests cover the core user journeys. |
 | 02. Architectural principles | Partial | `src/types.ts`, `src/runtime.ts`, `src/runtime/services.ts` | All main principles are represented. Partial only because built-in step and operation handlers remain runtime methods rather than standalone modules. |

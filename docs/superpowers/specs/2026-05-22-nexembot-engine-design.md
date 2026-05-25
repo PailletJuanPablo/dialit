@@ -1,12 +1,12 @@
-# Nexembot Engine Design
+# Dialit Engine Design
 
 ## Goal
 
-Implement a TypeScript conversational flow engine for the v0.1 architecture in `nexembot.md`. The engine executes published flow versions from structured definitions and returns messages, state, events, and decision traces for every turn.
+Implement a TypeScript conversational flow engine for the v0.1 architecture in `dialit.md`. The engine executes published flow versions from structured definitions and returns messages, state, events, and decision traces for every turn.
 
 ## Source Of Truth
 
-`nexembot.md` is authoritative. The existing `types.ts` contracts are useful starting points, but the implementation must extend them when they do not cover v0.1 requirements such as variable scopes, variable history, invalidation, flow calls, handoff, and custom operations.
+`dialit.md` is authoritative. The existing `types.ts` contracts are useful starting points, but the implementation must extend them when they do not cover v0.1 requirements such as variable scopes, variable history, invalidation, flow calls, handoff, and custom operations.
 
 All implementation code, public API names, tests, and examples must be in English.
 
