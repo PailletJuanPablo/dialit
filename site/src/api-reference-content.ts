@@ -664,10 +664,132 @@ export const apiReferenceGroups: readonly ApiReferenceGroup[] = [
           "type": "ConversationApi",
           "description": "API adapter with transport-friendly start, input, event, and response conversion methods."
         },
-        "example": "const api = createConversationApi({\n  flowVersions: [supportAssistantVersion],\n});\n\nconst response = await api.start({\n  conversationId: \"conversation-1\",\n  flowVersionId: \"support_assistant_v1\",\n});",
+        "methods": [
+          {
+            "name": "start",
+            "signature": "start(request: ConversationApiStartRequest): Promise<ConversationApiHttpResponse>",
+            "description": "Starts a conversation through the returned ConversationApi adapter.",
+            "parameters": [
+              {
+                "name": "request",
+                "type": "ConversationApiStartRequest",
+                "description": "Conversation id, flow version id, channel, user, initial variables, and metadata for the new conversation.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "Promise<ConversationApiHttpResponse>",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "sendMessage",
+            "signature": "sendMessage(request: ConversationApiTextRequest): Promise<ConversationApiHttpResponse>",
+            "description": "Submits a text message through the returned ConversationApi adapter.",
+            "parameters": [
+              {
+                "name": "request",
+                "type": "ConversationApiTextRequest",
+                "description": "Conversation id plus text, input id, turn id, channel, timestamp, and metadata for the user message.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "Promise<ConversationApiHttpResponse>",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "selectOption",
+            "signature": "selectOption(request: ConversationApiChoiceRequest): Promise<ConversationApiHttpResponse>",
+            "description": "Submits a menu or choice option through the returned ConversationApi adapter.",
+            "parameters": [
+              {
+                "name": "request",
+                "type": "ConversationApiChoiceRequest",
+                "description": "Conversation id plus option id, label, payload, channel, timestamp, and metadata for the selected choice.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "Promise<ConversationApiHttpResponse>",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "sendAttachments",
+            "signature": "sendAttachments(request: ConversationApiAttachmentRequest): Promise<ConversationApiHttpResponse>",
+            "description": "Submits attachment input through the returned ConversationApi adapter.",
+            "parameters": [
+              {
+                "name": "request",
+                "type": "ConversationApiAttachmentRequest",
+                "description": "Conversation id plus attachments, input id, turn id, channel, timestamp, and metadata.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "Promise<ConversationApiHttpResponse>",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "sendEvent",
+            "signature": "sendEvent(request: ConversationApiEventRequest): Promise<ConversationApiHttpResponse>",
+            "description": "Submits an external event through the returned ConversationApi adapter.",
+            "parameters": [
+              {
+                "name": "request",
+                "type": "ConversationApiEventRequest",
+                "description": "Conversation id plus event type, payload, input id, turn id, channel, timestamp, and metadata.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "Promise<ConversationApiHttpResponse>",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "toHttpResponse",
+            "signature": "toHttpResponse(result: ProcessTurnResult): ConversationApiHttpResponse",
+            "description": "Converts a ProcessTurnResult into the HTTP-friendly response shape used by the adapter.",
+            "parameters": [
+              {
+                "name": "result",
+                "type": "ProcessTurnResult",
+                "description": "Runtime turn result returned by the engine.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "ConversationApiHttpResponse",
+              "description": "HTTP-friendly response containing statusCode and body."
+            }
+          },
+          {
+            "name": "subscribeToEvents",
+            "signature": "subscribeToEvents(subscriber: ConversationEventSubscriber): ConversationEventSubscription",
+            "description": "Registers a subscriber for runtime event envelopes through the underlying engine.",
+            "parameters": [
+              {
+                "name": "subscriber",
+                "type": "ConversationEventSubscriber",
+                "description": "Callback that receives ConversationEventEnvelope values.",
+                "required": true
+              }
+            ],
+            "returns": {
+              "type": "ConversationEventSubscription",
+              "description": "Subscription object with unsubscribe()."
+            }
+          }
+        ],
+        "example": "const api = createConversationApi({\n  flowVersions: [supportAssistantVersion],\n});\n\nconst startResponse = await api.start({\n  conversationId: \"conversation-1\",\n  flowVersionId: \"support_assistant_v1\",\n});\n\nconst choiceResponse = await api.selectOption({\n  conversationId: startResponse.body.conversationId,\n  optionId: \"billing\",\n});",
         "related": [
           "ConversationEngine",
-          "CreateConversationEngineOptions"
+          "CreateConversationEngineOptions",
+          "ConversationApi"
         ]
       },
       {

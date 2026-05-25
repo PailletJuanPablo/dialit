@@ -22,9 +22,10 @@ const initialConversation = [
 const initialVariables: VariableRow[] = [["state", "waiting_for_menu_choice"]];
 const initialTrace = ["Waiting for a menu choice"];
 const initialCode = [
+  "const conversationId = \"conversation-1\";",
   "const api = createConversationApi({ flowVersions, actionHandlers });",
-  "await api.start({ flowVersionId: \"support_assistant_v1\" });",
-  "await api.selectOption({ optionId });",
+  "await api.start({ conversationId, flowVersionId: \"support_assistant_v1\" });",
+  "await api.selectOption({ conversationId, optionId });",
 ];
 
 const selectedChoiceId = ref<HomeDemoChoiceId>();

@@ -388,9 +388,10 @@ function eventLabel(type: string): string {
 
 function formatCode(choiceId: HomeDemoChoiceId): string[] {
   const lines = [
+    'const conversationId = "conversation-1";',
     "const api = createConversationApi({ flowVersions, actionHandlers });",
-    "await api.start({ flowVersionId: \"support_assistant_v1\" });",
-    `await api.selectOption({ optionId: "${choiceId}" });`,
+    "await api.start({ conversationId, flowVersionId: \"support_assistant_v1\" });",
+    `await api.selectOption({ conversationId, optionId: "${choiceId}" });`,
   ];
 
   if (choiceId === "technical_support") {

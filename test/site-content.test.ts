@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { runHomeDemoScenario } from "../site/src/lib/homeDemoFlow";
 import {
@@ -14,6 +15,64 @@ import {
 } from "../site/src/content";
 
 const repositoryHref = "https://github.com/PailletJuanPablo/dialit";
+
+function slugify(value: string) {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function exportedCallableMembersByEntry() {
+  const membersByEntry = new Map<string, string[]>();
+
+  for (const filePath of ["src/types.ts", "src/runtime-support.ts"]) {
+    const source = ts.createSourceFile(filePath, readFileSync(filePath, "utf8"), ts.ScriptTarget.Latest, true);
+
+    function visit(node: ts.Node) {
+      if (ts.isInterfaceDeclaration(node) || ts.isClassDeclaration(node)) {
+        if (node.name && isExported(node)) {
+          const members = callableMemberNames(node.members);
+          if (members.length) membersByEntry.set(node.name.text, members);
+        }
+      }
+
+      if (ts.isTypeAliasDeclaration(node) && isExported(node) && ts.isTypeLiteralNode(node.type)) {
+        const members = callableMemberNames(node.type.members);
+        if (members.length) membersByEntry.set(node.name.text, members);
+      }
+
+      ts.forEachChild(node, visit);
+    }
+
+    visit(source);
+  }
+
+  return membersByEntry;
+}
+
+function isExported(node: ts.Node) {
+  return Boolean(ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Export);
+}
+
+function callableMemberNames(members: ts.NodeArray<ts.ClassElement | ts.TypeElement>) {
+  return members.flatMap((member) => {
+    if (ts.isMethodSignature(member) || ts.isMethodDeclaration(member)) {
+      return memberName(member.name);
+    }
+    if (ts.isPropertySignature(member) && member.type && ts.isFunctionTypeNode(member.type)) {
+      return memberName(member.name);
+    }
+    return [];
+  });
+}
+
+function memberName(name: ts.PropertyName | undefined) {
+  if (!name) return [];
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return [name.text];
+  return [];
+}
 
 describe("Dialit public site content", () => {
   it("defines the public navigation pages", () => {
@@ -112,6 +171,19 @@ describe("Dialit public site content", () => {
       "Extensibility",
       "Validation and Errors",
     ]);
+  });
+
+  it("links feature API references to existing reference entries", () => {
+    const apiReferenceHrefs = new Set(
+      apiReferenceGroups.flatMap((group) => (
+        group.entries.map((entry) => `/api/${slugify(group.title)}/${slugify(entry.name)}`)
+      )),
+    );
+    const featureApiHrefs = featureSections
+      .map((section) => section.apiHref)
+      .filter((href): href is string => typeof href === "string" && href.startsWith("/api/"));
+
+    expect(featureApiHrefs.filter((href) => !apiReferenceHrefs.has(href))).toEqual([]);
   });
 
   it("keeps the tutorial chapter sequence complete", () => {
@@ -429,6 +501,9 @@ describe("Dialit public site content", () => {
     expect(apiReferenceGroups.flatMap((group) => group.entries).find((entry) => entry.name === "ConversationApi")?.methods?.map((method) => method.name)).toEqual(
       expect.arrayContaining(["start", "sendMessage", "selectOption", "sendAttachments", "sendEvent", "toHttpResponse"]),
     );
+    expect(apiReferenceGroups.flatMap((group) => group.entries).find((entry) => entry.name === "createConversationApi")?.methods?.map((method) => method.name)).toEqual(
+      apiReferenceGroups.flatMap((group) => group.entries).find((entry) => entry.name === "ConversationApi")?.methods?.map((method) => method.name),
+    );
   });
 
   it("documents every public API export as a reference entry", () => {
@@ -436,6 +511,18 @@ describe("Dialit public site content", () => {
     const missingEntries = allPublicApiExports.filter((name) => !referenceEntryNames.has(name));
 
     expect(missingEntries).toEqual([]);
+  });
+
+  it("documents callable members for every exported contract with methods", () => {
+    const apiEntries = new Map(apiReferenceGroups.flatMap((group) => group.entries.map((entry) => [entry.name, entry] as const)));
+    const missingMembers = [...exportedCallableMembersByEntry()].flatMap(([entryName, sourceMethods]) => {
+      const documentedMethods = apiEntries.get(entryName)?.methods?.map((method) => method.name) ?? [];
+      return sourceMethods
+        .filter((methodName) => !documentedMethods.includes(methodName))
+        .map((methodName) => `${entryName}.${methodName}`);
+    });
+
+    expect(missingMembers).toEqual([]);
   });
 
   it("documents linked API dependency types with real signatures and fields", () => {
@@ -521,5 +608,16 @@ describe("Dialit public site content", () => {
       ]),
     );
     expect(billing.trace).toEqual(expect.arrayContaining(["SemanticInputTask selected an allowed outcome"]));
+  });
+
+  it("keeps the home API snippet aligned with the adapter request contracts", async () => {
+    const homeConsoleSource = readFileSync("site/src/components/HomeFlowConsole.vue", "utf8");
+    const technical = await runHomeDemoScenario("technical_support");
+    const demoCode = technical.code.join("\n");
+
+    expect(homeConsoleSource).toContain('await api.start({ conversationId, flowVersionId: \\"support_assistant_v1\\" });');
+    expect(homeConsoleSource).toContain("await api.selectOption({ conversationId, optionId });");
+    expect(demoCode).toContain('await api.start({ conversationId, flowVersionId: "support_assistant_v1" });');
+    expect(demoCode).toContain('await api.selectOption({ conversationId, optionId: "technical_support" });');
   });
 });
