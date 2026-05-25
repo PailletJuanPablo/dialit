@@ -7,7 +7,11 @@ import TutorialPage from "./pages/TutorialPage.vue";
 
 export const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
-  scrollBehavior() {
+  scrollBehavior(to) {
+    if (to.hash) {
+      return { el: to.hash, top: 96 };
+    }
+
     return { top: 0 };
   },
   routes: [

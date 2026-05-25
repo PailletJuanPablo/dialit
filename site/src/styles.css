@@ -3468,9 +3468,40 @@ td {
   min-width: 0;
 }
 
+.api-nav-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .api-nav-entry-name {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.api-method-nav {
+  display: grid;
+  gap: 1px;
+  margin: 2px 0 6px 28px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.api-method-nav-link {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px !important;
+  padding: 5px 8px !important;
+  color: #8191a5 !important;
+  font-size: 12px !important;
+  font-weight: 800 !important;
+}
+
+.api-method-nav-link span {
+  color: rgba(34, 211, 238, 0.72);
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
 }
 
 .api-kind-badge {
@@ -3694,6 +3725,10 @@ td {
 .api-overview-band div,
 .tutorial-guide-panel {
   animation: surface-rise 480ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.method-list article {
+  scroll-margin-top: 96px;
 }
 
 .doc-content-transition {

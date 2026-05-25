@@ -20,6 +20,14 @@ function entryHref(groupTitle: string, entryName: string) {
   return `/api/${slugify(groupTitle)}/${slugify(entryName)}`;
 }
 
+function methodId(methodName: string) {
+  return `method-${slugify(methodName)}`;
+}
+
+function methodHref(groupTitle: string, entryName: string, methodName: string) {
+  return `${entryHref(groupTitle, entryName)}#${methodId(methodName)}`;
+}
+
 function kindBadge(kind: string) {
   const normalized = kind.toLowerCase();
   const badges: Record<string, { icon: string; label: string; className: string }> = {
@@ -46,6 +54,14 @@ const activeEntry = computed(() => (
 ));
 
 const activeContentKey = computed(() => `${activeGroup.value.title}:${activeEntry.value.name}`);
+
+function isActiveEntry(groupTitle: string, entryName: string) {
+  return activeGroup.value.title === groupTitle && activeEntry.value.name === entryName;
+}
+
+function isActiveMethod(groupTitle: string, entryName: string, methodName: string) {
+  return isActiveEntry(groupTitle, entryName) && route.hash === `#${methodId(methodName)}`;
+}
 
 const activeExamples = computed<readonly TutorialImplementation[]>(() => {
   if (activeEntry.value.examples?.length) {
@@ -188,23 +204,39 @@ function closeMobileNav() {
               {{ group.title }}
             </RouterLink>
           </h2>
-          <RouterLink
+          <div
             v-for="entry in group.entries"
             :key="entry.name"
-            :to="entryHref(group.title, entry.name)"
-            :class="['api-nav-entry', { active: activeGroup.title === group.title && activeEntry.name === entry.name }]"
-            @click="closeMobileNav"
+            class="api-nav-item"
           >
-            <span
-              class="api-kind-badge"
-              :class="kindBadge(entry.kind).className"
-              :title="kindBadge(entry.kind).label"
-              aria-hidden="true"
+            <RouterLink
+              :to="entryHref(group.title, entry.name)"
+              :class="['api-nav-entry', { active: isActiveEntry(group.title, entry.name) }]"
+              @click="closeMobileNav"
             >
-              {{ kindBadge(entry.kind).icon }}
-            </span>
-            <span class="api-nav-entry-name">{{ entry.name }}</span>
-          </RouterLink>
+              <span
+                class="api-kind-badge"
+                :class="kindBadge(entry.kind).className"
+                :title="kindBadge(entry.kind).label"
+                aria-hidden="true"
+              >
+                {{ kindBadge(entry.kind).icon }}
+              </span>
+              <span class="api-nav-entry-name">{{ entry.name }}</span>
+            </RouterLink>
+            <div v-if="entry.methods?.length" class="api-method-nav" aria-label="Methods">
+              <RouterLink
+                v-for="method in entry.methods"
+                :key="method.name"
+                :to="methodHref(group.title, entry.name, method.name)"
+                :class="['api-method-nav-link', { active: isActiveMethod(group.title, entry.name, method.name) }]"
+                @click="closeMobileNav"
+              >
+                <span aria-hidden="true">#</span>
+                {{ method.name }}
+              </RouterLink>
+            </div>
+          </div>
         </section>
       </nav>
     </aside>
@@ -315,7 +347,7 @@ function closeMobileNav() {
           <section v-if="activeEntry.methods?.length" class="doc-page-section">
             <h2>Methods</h2>
             <div class="method-list">
-              <article v-for="method in activeEntry.methods" :key="method.name">
+              <article v-for="method in activeEntry.methods" :id="methodId(method.name)" :key="method.name">
                 <h3>{{ method.name }}<em v-if="method.required === false">optional</em></h3>
                 <CodeBlock :code="method.signature" language="ts" />
                 <p>{{ method.description }}</p>

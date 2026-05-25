@@ -525,6 +525,23 @@ describe("Dialit public site content", () => {
     expect(missingMembers).toEqual([]);
   });
 
+  it("renders documented methods as nested API navigation links with anchors", () => {
+    const apiPageSource = readFileSync("site/src/pages/ApiPage.vue", "utf8");
+    const routerSource = readFileSync("site/src/router.ts", "utf8");
+    const entryNames = new Set(apiReferenceGroups.flatMap((group) => group.entries.map((entry) => entry.name)));
+
+    expect(apiPageSource).toContain("function methodId(methodName: string)");
+    expect(apiPageSource).toContain("function methodHref(groupTitle: string, entryName: string, methodName: string)");
+    expect(apiPageSource).toContain('class="api-method-nav"');
+    expect(apiPageSource).toContain(':to="methodHref(group.title, entry.name, method.name)"');
+    expect(apiPageSource).toContain(':id="methodId(method.name)"');
+    expect(routerSource).toContain("if (to.hash)");
+    expect(routerSource).toContain("el: to.hash");
+    expect(entryNames).not.toContain("start");
+    expect(entryNames).not.toContain("selectOption");
+    expect(entryNames).not.toContain("sendMessage");
+  });
+
   it("documents linked API dependency types with real signatures and fields", () => {
     const entries = new Map(apiReferenceGroups.flatMap((group) => group.entries.map((entry) => [entry.name, entry] as const)));
     const requiredSymbols = [
