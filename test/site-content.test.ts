@@ -602,6 +602,81 @@ describe("Dialit public site content", () => {
     expect(stylesSource).toContain(".api-nav-entry");
   });
 
+  it("rejects generic, missing, duplicated, or generated API reference descriptions", () => {
+    const apiReferenceSource = readFileSync("site/src/api-reference-content.ts", "utf8");
+    const apiEntries = apiReferenceGroups.flatMap((group) => group.entries);
+    const descriptions = apiReferenceGroups.flatMap((group) => group.entries.flatMap((entry) => [
+      { path: `${entry.name}.purpose`, value: entry.purpose },
+      { path: `${entry.name}.usage`, value: entry.usage },
+      ...(entry.returns ? [{ path: `${entry.name}.returns`, value: entry.returns.description }] : []),
+      ...(entry.properties ?? []).map((property) => ({
+        path: `${entry.name}.${property.name}`,
+        value: property.description,
+      })),
+      ...(entry.parameters ?? []).map((parameter) => ({
+        path: `${entry.name}(${parameter.name})`,
+        value: parameter.description,
+      })),
+      ...(entry.methods ?? []).flatMap((method) => [
+        { path: `${entry.name}.${method.name}`, value: method.description },
+        ...(method.returns ? [{ path: `${entry.name}.${method.name}.returns`, value: method.returns.description }] : []),
+        ...(method.parameters ?? []).map((parameter) => ({
+          path: `${entry.name}.${method.name}.${parameter.name}`,
+          value: parameter.description,
+        })),
+      ]),
+    ]));
+    const sourceBannedPatterns = [
+      "rawApiReferenceGroups",
+      "refineApiReference",
+      "reusableDescription",
+      "humanizeIdentifier",
+      "isFillerDescription",
+    ];
+    const fillerPattern = /\b(?:member exposed by|method exposed by|export member exposed by|Creates d by|Result produced by|data used by|String value used as|Use this contract when|Use this type to|Use this marker type|Return value produced by this method|This method does not require arguments|defines the .* contract with|Discriminator or value category for this contract|Lifecycle, operation, action, handoff, or processing status|Application metadata carried with runtime objects|HTTP-friendly response containing statusCode and body|Registers a provider, handler, resolver, validator, normalizer, or extractor|Loads a record by id|Persists a record|Lists stored records for one conversation id|Returns the registered handler for the requested type|Checks whether a handler is registered for the requested type|from Root package|contract field|when working with|carries .* for its|specific path|value read from|by the owner|API surface|typed runtime boundary|described by its signature|typed as|argument passed|state needed for that boundary|performs the .* package operation|describes .* behavior in the|data stored on|using (?:a|an|the) .* shape|models .* workflows|represents .* data in .* workflows|field on .*declared as|helper used by Dialit applications and tests|groups imports that applications use together|stored by this record|Payload value stored|Promise resolved by|returns .* value for the caller)\b/i;
+    const pendingPattern = /\b(?:todo|tbd|pendiente|fill in|to be documented|pending description|pending documentation)\b/i;
+    const sourceIssues = [
+      ...sourceBannedPatterns
+        .filter((pattern) => apiReferenceSource.includes(pattern))
+        .map((pattern) => `source:${pattern}`),
+      ...(fillerPattern.test(apiReferenceSource) ? ["source:filler-pattern"] : []),
+      ...(pendingPattern.test(apiReferenceSource) ? ["source:pending-pattern"] : []),
+    ];
+    const missingDescriptions = descriptions
+      .filter((description) => typeof description.value !== "string" || description.value.trim().length === 0)
+      .map((description) => description.path);
+    const fillerDescriptions = descriptions
+      .filter((description): description is { path: string; value: string } => typeof description.value === "string")
+      .filter((description) => fillerPattern.test(description.value) || pendingPattern.test(description.value))
+      .map((description) => `${description.path}: ${description.value}`);
+    const duplicateDescriptions = [...descriptions
+      .filter((description): description is { path: string; value: string } => typeof description.value === "string")
+      .filter((description) => description.value.trim().length > 0)
+      .reduce((byDescription, description) => {
+        const paths = byDescription.get(description.value) ?? [];
+        paths.push(description.path);
+        byDescription.set(description.value, paths);
+        return byDescription;
+      }, new Map<string, string[]>())]
+      .filter(([, paths]) => paths.length > 1)
+      .map(([description, paths]) => `${description} -> ${paths.join(", ")}`);
+    const flowVersion = apiEntries.find((entry) => entry.name === "FlowVersion");
+    const flowVersionDescriptions = new Map(
+      flowVersion?.properties?.map((property) => [property.name, property.description] as const),
+    );
+
+    expect([
+      ...sourceIssues,
+      ...missingDescriptions.map((path) => `missing:${path}`),
+      ...fillerDescriptions.map((description) => `filler:${description}`),
+      ...duplicateDescriptions.map((description) => `duplicate:${description}`),
+    ]).toEqual([]);
+    expect(flowVersionDescriptions.get("checksum")).toBe("Optional integrity hash for the exact flow definition payload.");
+    expect(flowVersionDescriptions.get("publishedAt")).toBe("ISO timestamp recorded when this version was published.");
+    expect(flowVersionDescriptions.get("publishedBy")).toBe("Identifier of the actor or process that published this version.");
+    expect(flowVersionDescriptions.get("createdBy")).toBe("Identifier of the actor or process that created this version.");
+  });
+
   it("runs the home demo through the real Dialit API adapter", async () => {
     const technical = await runHomeDemoScenario("technical_support");
     expect(technical.menuChoices.map((choice) => choice.optionId)).toEqual([
